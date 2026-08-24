@@ -461,26 +461,30 @@ async function dbGuardarUbicacion(id, lat, lon) {
   });
 }
 
-/* ---------- Hojas de ruta ---------- */
+/* ---------- Hojas de ruta ----------
+   El motor calcula con decimales; las columnas de minutos son enteras.
+   Redondear acá, en el borde, y no confiar en que la base lo haga. */
+const entero = v => (v == null || isNaN(v)) ? null : Math.round(Number(v));
+
 async function dbGuardarHoja(r, ESTADO) {
   const hoja = (await insertar('hojas_ruta', {
     fecha: ESTADO.fecha,
     vehiculo_id: ESTADO.vehiculo,
     hora_salida: ESTADO.salida,
-    minutos_jornada: ESTADO.jornada,
+    minutos_jornada: entero(ESTADO.jornada),
     estado: 'Planificada',
     zona_principal: r.rutas[0].zonaPrincipal,
     km_total: r.rutas.reduce((s, x) => s + x.kmTotal, 0).toFixed(1),
-    minutos_total: r.rutas.reduce((s, x) => s + x.minTotal, 0),
+    minutos_total: entero(r.rutas.reduce((s, x) => s + x.minTotal, 0)),
     fuente_distancia: r.fuente || null
   }))[0];
 
   const paradas = [];
   r.rutas.forEach(ru => ru.paradas.forEach(p => paradas.push({
-    hoja_id: hoja.id, ruta_nro: ru.nro, orden: p.n, punto_id: p.punto.id,
+    hoja_id: hoja.id, ruta_nro: entero(ru.nro), orden: entero(p.n), punto_id: p.punto.id,
     km_tramo: p.km != null ? Number(p.km).toFixed(1) : null,
-    minutos_tramo: p.min != null ? Math.round(p.min) : null,
-    minutos_servicio: p.servicio != null ? Math.round(p.servicio) : null,
+    minutos_tramo: entero(p.min),
+    minutos_servicio: entero(p.servicio),
     hora_estimada: p.llegada || null,
     ultima_obligatoria: !!p.ultimaObligatoria,
     fuera_horario: !!p.fueraDeHorario
@@ -495,7 +499,7 @@ async function dbGuardarHoja(r, ESTADO) {
   r.rutas.forEach(ru => ru.paradas.forEach(p => p.pedidos.forEach(c => pedidos.push({
     parada_id: idDe[ru.nro + '·' + p.n],
     cliente_id: c.id,
-    cajas: c.cajas != null ? Math.round(c.cajas) : null,
+    cajas: entero(c.cajas),
     pallets: c.pallets != null ? Number(c.pallets).toFixed(1) : null,
     referencia: c.referencia || null,
     entregado: null
