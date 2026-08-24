@@ -1726,16 +1726,43 @@ async function vaciarHistorial() {
 }
 
 /* ========================= CLIENTES ========================= */
+/* "Almirante Brown" tiene que encontrarse escribiendo "almirante brown",
+   y "Berón de Astrada" escribiendo "beron". */
+const sinTildes = s => String(s == null ? '' : s).toLowerCase()
+  .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+/* Todo lo que identifica a un cliente, junto, para poder buscarlo por cualquier parte. */
+function textoBuscable(c) {
+  const p = c.punto ? punto(c.punto) : null;
+  return sinTildes([
+    c.id, c.nombre, c.regla, c.tipoEntrega, c.modo,
+    p && p.id, p && p.transporte, p && p.nombre,
+    p && p.dir, p && p.loc, p && p.partido, p && p.provincia, p && p.zona
+  ].filter(Boolean).join(' '));
+}
+
 function clientes() {
   const cs = DATOS.clientes.slice().sort((a, b) => a.nombre.localeCompare(b.nombre));
   $('#vista').innerHTML = `
   <div class="top"><div><h1>Clientes</h1><p>${DATOS.clientes.length} clientes · ${DATOS.puntos.length} puntos de entrega</p></div>
-    <div class="row no-print"><input type="text" id="qc" placeholder="Buscar…"><button class="btn pri" onclick="editarCliente()">+ Agregar cliente</button></div></div>
+    <div class="row no-print"><input type="text" id="qc" style="min-width:290px"
+      placeholder="Buscar por cliente, dirección, localidad o transporte…"><button class="btn pri" onclick="editarCliente()">+ Agregar cliente</button></div></div>
+  <p class="mini no-print" id="qcCuenta" style="margin:-6px 0 10px"></p>
   <div class="panel" style="padding:0"><div class="tabla-wrap"><table>
     <thead><tr><th>Código</th><th>Razón social</th><th>Punto de entrega</th><th>Tipo</th><th>Modo de carga</th><th>Reglas</th><th class="no-print"></th></tr></thead>
     <tbody id="tbc"></tbody></table></div></div>`;
   const pintar = (q = '') => {
-    $('#tbc').innerHTML = cs.filter(c => !q || c.nombre.toLowerCase().includes(q)).map(c => {
+    const partes = sinTildes(q).split(/\s+/).filter(Boolean);
+    const hallados = cs.filter(c => {
+      if (!partes.length) return true;
+      const t = textoBuscable(c);
+      return partes.every(p => t.includes(p));      // todas las palabras, en cualquier orden
+    });
+    const cuenta = $('#qcCuenta');
+    if (cuenta) cuenta.textContent = !partes.length ? ''
+      : hallados.length === 1 ? '1 cliente encontrado'
+      : `${hallados.length} clientes encontrados`;
+    $('#tbc').innerHTML = hallados.map(c => {
       const p = c.punto ? punto(c.punto) : null;
       return `<tr><td>${esc(c.id)}</td><td><b>${esc(c.nombre)}</b></td>
         <td>${p ? (p.transporte ? '<b>' + esc(p.transporte) + '</b><br>' : '') + esc(p.dir) + '<br><span class="mini">' + esc(p.loc || p.partido) + '</span>' : '<span class="mini">Retira el cliente</span>'}</td>
@@ -1745,7 +1772,7 @@ function clientes() {
         <td class="no-print"><button class="btn sm" onclick="editarCliente('${c.id}')">Editar</button></td></tr>`;
     }).join('');
   };
-  pintar(); $('#qc').oninput = e => pintar(e.target.value.toLowerCase());
+  pintar(); $('#qc').oninput = e => pintar(e.target.value);
 }
 
 function editarCliente(id) {
