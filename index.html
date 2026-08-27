@@ -488,6 +488,11 @@ async function dbGuardarUbicacion(id, lat, lon) {
    Redondear acá, en el borde, y no confiar en que la base lo haga. */
 const entero = v => (v == null || isNaN(v)) ? null : Math.round(Number(v));
 
+/* Cómo se lee en pantalla una parada en un proveedor. */
+const etiquetaVisita = t => t === 'ENTREGA' ? 'Materia prima'
+                          : t === 'AMBAS'   ? 'Materia prima y retiro'
+                          : 'Retiro';
+
 async function dbGuardarHoja(r, ESTADO) {
   const hoja = (await insertar('hojas_ruta', {
     fecha: ESTADO.fecha,
@@ -505,21 +510,29 @@ async function dbGuardarHoja(r, ESTADO) {
   // Los retiros van como paradas más, después de la última entrega de su ruta.
   r.rutas.forEach(ru => (ru.retiros || []).forEach(x => paradas.push({
     hoja_id: hoja.id, ruta_nro: entero(ru.nro), orden: 100 + x.n,
-    punto_id: null, proveedor_id: x.proveedor.id,
+    punto_id: null, proveedor_id: x.proveedor.id, tipo_visita: 'RETIRO',
     km_tramo: x.km != null ? Number(x.km).toFixed(1) : null,
     minutos_tramo: entero(x.min), minutos_servicio: entero(x.servicio),
     hora_estimada: x.llegada || null,
     ultima_obligatoria: false, fuera_horario: !!x.fueraDeHorario
   })));
-  r.rutas.forEach(ru => ru.paradas.forEach(p => paradas.push({
-    hoja_id: hoja.id, ruta_nro: entero(ru.nro), orden: entero(p.n), punto_id: p.punto.id,
-    km_tramo: p.km != null ? Number(p.km).toFixed(1) : null,
-    minutos_tramo: entero(p.min),
-    minutos_servicio: entero(p.servicio),
-    hora_estimada: p.llegada || null,
-    ultima_obligatoria: !!p.ultimaObligatoria,
-    fuera_horario: !!p.fueraDeHorario
-  })));
+  /* Una parada en un proveedor al que se le lleva materia prima va como parada
+     normal del recorrido, pero apunta a proveedores y no a puntos_entrega. */
+  r.rutas.forEach(ru => ru.paradas.forEach(p => {
+    const prov = p.punto.esProveedor ? p.punto.proveedor : null;
+    paradas.push({
+      hoja_id: hoja.id, ruta_nro: entero(ru.nro), orden: entero(p.n),
+      punto_id: prov ? null : p.punto.id,
+      proveedor_id: prov ? prov.id : null,
+      tipo_visita: prov ? (p.punto.modoProveedor || 'ENTREGA') : null,
+      km_tramo: p.km != null ? Number(p.km).toFixed(1) : null,
+      minutos_tramo: entero(p.min),
+      minutos_servicio: entero(p.servicio),
+      hora_estimada: p.llegada || null,
+      ultima_obligatoria: !!p.ultimaObligatoria,
+      fuera_horario: !!p.fueraDeHorario
+    });
+  }));
   const filas = await insertar('paradas', paradas);
 
   const clave = f => f.ruta_nro + '·' + f.orden;
@@ -541,7 +554,7 @@ async function dbGuardarHoja(r, ESTADO) {
 
 async function dbCargarHistorial() {
   const hojas = await leer(
-    'hojas_ruta?select=*,paradas(ruta_nro,orden,punto_id,proveedor_id,' +
+    'hojas_ruta?select=*,paradas(ruta_nro,orden,punto_id,proveedor_id,tipo_visita,' +
     'puntos_entrega(nombre,transporte,zona),proveedores(nombre),' +
     'pedidos(id,entregado,motivo_no_entrega,observacion,clientes(razon_social)))' +
     '&order=fecha.desc&limit=200');
@@ -555,7 +568,7 @@ async function dbCargarHistorial() {
         ruta: pa.ruta_nro, orden: pa.orden,
         cliente: (pd.clientes && pd.clientes.razon_social) || '(cliente borrado)',
         punto: pa.puntos_entrega ? (pa.puntos_entrega.transporte || pa.puntos_entrega.nombre)
-             : pa.proveedores ? 'Retiro · ' + pa.proveedores.nombre
+             : pa.proveedores ? etiquetaVisita(pa.tipo_visita) + ' · ' + pa.proveedores.nombre
              : (pa.punto_id || pa.proveedor_id || '—'),
         zona: pa.puntos_entrega ? pa.puntos_entrega.zona : '',
         entregado: pd.entregado, motivo: pd.motivo_no_entrega || '', obs: pd.observacion || ''
@@ -855,8 +868,33 @@ function unidadesACajas(lineas, catalogo) {
 /* ===========================================================
    PLANIFICADOR
    =========================================================== */
+/* Un proveedor al que hay que LLEVARLE materia prima se comporta como una entrega
+   más: el camión sale de BARUK con esa carga, así que la parada puede ir en
+   cualquier lugar del recorrido y conviene que el optimizador la ubique donde
+   menos kilómetros cueste. Por eso se lo convierte en un punto sintético.
+   Los retiros puros, en cambio, siguen yendo al final: no hay lugar en el camión
+   hasta que se vació. Si el proveedor es "AMBAS" (le dejo materia prima y me
+   traigo producto terminado) la parada es una sola y va como entrega, porque el
+   hueco lo deja la propia materia prima que se descarga ahí. */
+const MODOS_PROVEEDOR = ['RETIRO', 'ENTREGA', 'AMBAS'];
+const modoProveedor = p => MODOS_PROVEEDOR.includes(p && p.modo) ? p.modo : 'RETIRO';
+const llevaCarga = p => modoProveedor(p) !== 'RETIRO';
+
+function puntoDeProveedor(prov) {
+  const v = ventanaProveedor(prov.horario);
+  return {
+    id: 'PROV:' + prov.id, nombre: prov.nombre, transporte: null, tipo: 'PROVEEDOR',
+    dir: prov.dir, loc: prov.loc, partido: '', provincia: '', zona: 'Proveedores',
+    lat: prov.lat, lon: prov.lon, ventanas: v, estado: 'OK',
+    esProveedor: true, proveedor: prov, modoProveedor: modoProveedor(prov)
+  };
+}
+
 async function planificar(opts) {
-  const { seleccion, datos, vehiculo, horaSalida, minutosJornada, onEstado, retiros } = opts;
+  const { seleccion, datos, vehiculo, horaSalida, minutosJornada, onEstado } = opts;
+  const provsTodos = (opts.retiros || []).filter(p => p.lat != null && p.lon != null);
+  const provsEntrega = provsTodos.filter(llevaCarga);
+  const retiros = provsTodos.filter(p => !llevaCarga(p));
 
   // 1. Agrupar los pedidos por punto físico
   const porPunto = new Map();
@@ -884,13 +922,24 @@ async function planificar(opts) {
     omitidos
   };
 
+  // 1bis. Los proveedores a los que se les lleva materia prima entran como paradas
+  //       más del recorrido, sin pedidos asociados.
+  const puntosProv = provsEntrega.map(puntoDeProveedor);
+  puntosProv.forEach(p => { puntos.push(p); porPunto.set(p.id, []); });
+
   // 2. Matriz
   const nodos = [datos.baruk, ...puntos];
   const { M, real, fuente, motivo } = await construirMatriz(nodos, onEstado);
 
   // 3. Tiempo de servicio por parada
   const servicio = {};
+  const minRetiro = (datos.jornada && datos.jornada.minutosRetiro) || 20;
   puntos.forEach((p, k) => {
+    if (p.esProveedor) {
+      // Descargar la materia prima y, si además se retira, cargar el producto terminado.
+      servicio[k + 1] = p.modoProveedor === 'AMBAS' ? minRetiro * 2 : minRetiro;
+      return;
+    }
     const pedidos = porPunto.get(p.id);
     const base = p.tipo === 'TRANSPORTE' ? datos.jornada.descargaTransporte : datos.jornada.descargaCliente;
     servicio[k + 1] = base + (pedidos.length - 1) * 5;   // +5 min por pedido extra en la misma parada
@@ -1014,7 +1063,10 @@ async function planificar(opts) {
     reloj.setMinutes(reloj.getMinutes() + vuelta.min);
 
     const pedidosTodos = paradas.flatMap(p => p.pedidos);
-    const zonas = [...new Set(paradas.map(p => p.punto.zona))];
+    // Los proveedores no cuentan para las zonas: si no, una parada en Berisso
+    // hace parecer que la ruta está dispersa cuando no lo está.
+    const entregas = paradas.filter(p => !p.punto.esProveedor);
+    const zonas = [...new Set((entregas.length ? entregas : paradas).map(p => p.punto.zona))];
 
     return {
       nro: nro + 1, paradas, kmVuelta: vuelta.km, minVuelta: vuelta.min,
@@ -1086,6 +1138,17 @@ async function planificar(opts) {
      cuando se vacía puede levantar mercadería. Es lo mismo que pasa con Celsur,
      que exige entrar solo con lo de ellos pero deja salir a buscar proveedores.
      Si el día se dividió en varias rutas, los retiros van en la última. */
+  if (puntosProv.length) {
+    const nom = puntosProv.map(p => p.nombre).join(', ');
+    avisos.push({
+      tipo: 'proveedor',
+      texto: `${puntosProv.length === 1 ? 'La parada en' : 'Las paradas en'} ${nom} ${puntosProv.length === 1 ? 'es' : 'son'} ` +
+             `con materia prima que sale de BARUK, así que ${puntosProv.length === 1 ? 'va' : 'van'} intercalada${puntosProv.length === 1 ? '' : 's'} ` +
+             `entre las entregas, donde menos kilómetros cuesta. ` +
+             `Ojo: el lugar que ocupa esa materia prima en el camión no está contado en la carga, ` +
+             `porque no tenemos cargadas sus cajas.`
+    });
+  }
   if (retiros && retiros.length && rutas.length) {
     const ruta = rutas[rutas.length - 1];
     await sumarRetiros(ruta, retiros, datos, horaSalida);
@@ -2609,28 +2672,65 @@ function editarCliente(id, previo) {
 }
 
 /* =========================================================
-   Retiros en proveedores.
-   El camión sale cargado: los retiros van después de todas las entregas.
+   Paradas en proveedores.
+   Tres casos distintos, y no dan lo mismo para el recorrido:
+   · RETIRO  → sólo se levanta mercadería. Va al final de todo, cuando el
+               camión ya se vació: antes no hay lugar.
+   · ENTREGA → se le lleva materia prima desde BARUK (el caso de Magraner).
+               El camión sale con esa carga, así que la parada puede ir en
+               cualquier punto del recorrido y el optimizador la ubica donde
+               menos kilómetros cueste.
+   · AMBAS   → se le deja materia prima y se retira producto terminado en la
+               misma visita. Va como entrega: el hueco lo deja la propia
+               materia prima que se descarga ahí.
    ========================================================= */
-ESTADO.retiros = new Set();
+ESTADO.retiros = new Map();   // id de proveedor -> 'RETIRO' | 'ENTREGA' | 'AMBAS'
+
+const MODOS_VISITA = [
+  ['RETIRO',  'Retiro mercadería'],
+  ['ENTREGA', 'Le llevo materia prima'],
+  ['AMBAS',   'Le llevo y retiro']
+];
+const textoModoVisita = m => (MODOS_VISITA.find(x => x[0] === m) || MODOS_VISITA[0])[1];
+
+function contarRetiros() {
+  const n = $('#retirosCuenta');
+  if (n) n.textContent = ESTADO.retiros.size
+    ? `${ESTADO.retiros.size} seleccionado${ESTADO.retiros.size === 1 ? '' : 's'}` : '';
+}
 
 function pintarRetiros() {
   const caja = $('#retirosBox');
   if (!caja) return;
   const provs = DATOS.proveedores.filter(p => p.lat != null && p.lon != null);
   const sin = DATOS.proveedores.length - provs.length;
-  caja.innerHTML = provs.map(p => `
-    <label class="fila-prov" style="display:flex;gap:9px;align-items:flex-start;padding:6px 0;cursor:pointer">
-      <input type="checkbox" data-prov="${esc(p.id)}" ${ESTADO.retiros.has(p.id) ? 'checked' : ''} style="margin-top:3px">
-      <span><b>${esc(p.nombre)}</b><br>
-        <span class="mini">${esc(p.dir)}${p.loc ? ' · ' + esc(p.loc) : ''}${p.horario ? ' · recibe ' + esc(p.horario) : ''}</span></span>
-    </label>`).join('') +
+  caja.innerHTML = provs.map(p => {
+    const elegido = ESTADO.retiros.has(p.id);
+    const modo = elegido ? ESTADO.retiros.get(p.id) : 'RETIRO';
+    return `
+    <div class="fila-prov" style="display:flex;gap:9px;align-items:flex-start;padding:7px 0;border-top:1px solid var(--linea)">
+      <input type="checkbox" data-prov="${esc(p.id)}" ${elegido ? 'checked' : ''} style="margin-top:4px;cursor:pointer">
+      <div style="flex:1">
+        <b>${esc(p.nombre)}</b><br>
+        <span class="mini">${esc(p.dir)}${p.loc ? ' · ' + esc(p.loc) : ''}${p.horario ? ' · recibe ' + esc(p.horario) : ''}</span>
+      </div>
+      <select data-modo="${esc(p.id)}" ${elegido ? '' : 'disabled'} style="max-width:210px">
+        ${MODOS_VISITA.map(([v, t]) => `<option value="${v}" ${modo === v ? 'selected' : ''}>${t}</option>`).join('')}
+      </select>
+    </div>`;
+  }).join('') +
     (sin ? `<p class="mini" style="margin:8px 0 0;color:var(--rojo)">${sin} proveedor${sin === 1 ? '' : 'es'} sin ubicación: no se puede calcular el camino hasta ahí.</p>` : '');
+
   caja.querySelectorAll('input[data-prov]').forEach(ch => ch.onchange = e => {
     const id = e.target.dataset.prov;
-    e.target.checked ? ESTADO.retiros.add(id) : ESTADO.retiros.delete(id);
-    const n = $('#retirosCuenta');
-    if (n) n.textContent = ESTADO.retiros.size ? `${ESTADO.retiros.size} seleccionado${ESTADO.retiros.size === 1 ? '' : 's'}` : '';
+    const sel = caja.querySelector(`select[data-modo="${CSS.escape(id)}"]`);
+    if (e.target.checked) { ESTADO.retiros.set(id, sel ? sel.value : 'RETIRO'); if (sel) sel.disabled = false; }
+    else { ESTADO.retiros.delete(id); if (sel) sel.disabled = true; }
+    contarRetiros();
+  });
+  caja.querySelectorAll('select[data-modo]').forEach(sl => sl.onchange = e => {
+    const id = e.target.dataset.modo;
+    if (ESTADO.retiros.has(id)) ESTADO.retiros.set(id, e.target.value);
   });
 }
 
@@ -2642,13 +2742,15 @@ nueva = function () {
   const panel = document.createElement('div');
   panel.className = 'panel';
   panel.innerHTML = `
-    <h3>Retiros en proveedores <span class="mini" id="retirosCuenta" style="font-weight:400;color:var(--mute)"></span></h3>
-    <p class="desc">Se hacen <b>al terminar todas las entregas</b>, cuando el camión ya se vació, y antes de volver a BARUK.</p>
+    <h3>Paradas en proveedores <span class="mini" id="retirosCuenta" style="font-weight:400;color:var(--mute)"></span></h3>
+    <p class="desc">Tildá el proveedor y elegí qué se hace ahí.
+      Los <b>retiros</b> van al final de todas las entregas, cuando el camión ya se vació.
+      Cuando le <b>llevás materia prima</b>, en cambio, la parada se intercala entre las entregas,
+      donde menos kilómetros cueste.</p>
     <div id="retirosBox"></div>`;
   pend.parentNode.insertBefore(panel, pend);
   pintarRetiros();
-  const n = $('#retirosCuenta');
-  if (n && ESTADO.retiros.size) n.textContent = `${ESTADO.retiros.size} seleccionado${ESTADO.retiros.size === 1 ? '' : 's'}`;
+  contarRetiros();
 };
 
 const generarOriginal = generar;
@@ -2659,7 +2761,8 @@ generar = async function () {
   const r = await planificar({
     seleccion: seleccionados(), datos: DATOS, vehiculo: v,
     horaSalida: ESTADO.salida, minutosJornada: ESTADO.jornada,
-    retiros: DATOS.proveedores.filter(p => ESTADO.retiros.has(p.id) && p.lat != null),
+    retiros: DATOS.proveedores.filter(p => ESTADO.retiros.has(p.id) && p.lat != null)
+                              .map(p => ({ ...p, modo: ESTADO.retiros.get(p.id) })),
     onEstado: t => btn.textContent = t
   });
   btn.disabled = false; btn.textContent = 'GENERAR HOJA DE RUTA';
@@ -2669,28 +2772,53 @@ generar = async function () {
   resultado();
 };
 
-/* Los retiros se dibujan como filas extra entre la última entrega y el regreso. */
+/* Las paradas en proveedores se ven distinto según lo que se hace ahí:
+   las de materia prima quedan intercaladas con las entregas (el motor ya las
+   ubicó en el orden que corresponde) y los retiros van al final, antes del regreso. */
 const bloqueRutaOriginal = bloqueRuta;
 bloqueRuta = function (ru, varias) {
   let html = bloqueRutaOriginal(ru, varias);
-  if (!ru.retiros || !ru.retiros.length) return html;
 
-  const filas = ru.retiros.map(x => `<tr>
-    <td><span class="pin" style="background:var(--narc)">R${x.n}</span></td>
-    <td><span class="mini">retiro de mercadería</span></td>
-    <td><b>${esc(x.proveedor.nombre)}</b>${x.ventanaTexto ? `<br><span class="badge ${x.fueraDeHorario ? 'b-al' : 'b-gra'}">recibe ${esc(x.ventanaTexto)}</span>` : ''}</td>
-    <td>${esc(x.proveedor.dir)}<br><span class="mini">${esc(x.proveedor.loc || '')}</span></td>
-    <td><span class="badge b-pal">Retiro</span></td>
-    <td class="num">${km1(x.km)}</td>
-    <td class="num">${x.fueraDeHorario ? `<b style="color:var(--rojo)" title="Llega fuera del horario del proveedor">${x.llegada} ⚠</b>` : x.llegada}</td></tr>`).join('');
+  /* 1. Las paradas de proveedor que vienen dentro del recorrido: el HTML original
+        las pintó como si fueran un cliente. Se les corrige la celda de pedidos y
+        la etiqueta de tipo. Se hace por posición de fila para no depender del texto. */
+  const conProv = ru.paradas.filter(p => p.punto.esProveedor);
+  if (conProv.length) {
+    const cont = document.createElement('div');
+    cont.innerHTML = html;
+    const cuerpo = cont.querySelector('table tbody');   // la primera tabla es la del recorrido
+    const filas = cuerpo ? [...cuerpo.children] : [];
+    ru.paradas.forEach((p, i) => {
+      if (!p.punto.esProveedor) return;
+      const tr = filas[i + 1];               // +1: la primera fila es la salida de BARUK
+      if (!tr) return;
+      const td = tr.children;
+      const modo = p.punto.modoProveedor || 'ENTREGA';
+      td[1].innerHTML = `<span class="mini">${modo === 'AMBAS'
+        ? 'se le deja materia prima y se retira producto' : 'se le deja materia prima'}</span>`;
+      td[4].innerHTML = `<span class="badge b-pal">${modo === 'AMBAS' ? 'Materia prima y retiro' : 'Materia prima'}</span>`;
+      tr.style.background = 'rgba(240,138,0,.07)';
+    });
+    html = cont.innerHTML;
+  }
 
-  // Entran justo antes de la fila de regreso a BARUK
-  const marca = '<tr><td><b>Regreso</b>';
-  html = html.replace(marca, filas + marca);
+  /* 2. Los retiros puros, como filas extra justo antes del regreso a BARUK. */
+  if (ru.retiros && ru.retiros.length) {
+    const filas = ru.retiros.map(x => `<tr style="background:rgba(240,138,0,.07)">
+      <td><span class="pin" style="background:var(--narc)">R${x.n}</span></td>
+      <td><span class="mini">retiro de mercadería</span></td>
+      <td><b>${esc(x.proveedor.nombre)}</b>${x.ventanaTexto ? `<br><span class="badge ${x.fueraDeHorario ? 'b-al' : 'b-gra'}">recibe ${esc(x.ventanaTexto)}</span>` : ''}</td>
+      <td>${esc(x.proveedor.dir)}<br><span class="mini">${esc(x.proveedor.loc || '')}</span></td>
+      <td><span class="badge b-pal">Retiro</span></td>
+      <td class="num">${km1(x.km)}</td>
+      <td class="num">${x.fueraDeHorario ? `<b style="color:var(--rojo)" title="Llega fuera del horario del proveedor">${x.llegada} ⚠</b>` : x.llegada}</td></tr>`).join('');
+    const marca = '<tr><td><b>Regreso</b>';
+    html = html.replace(marca, filas + marca);
+  }
 
-  // Y el enlace a Google Maps tiene que incluirlos
+  /* 3. El enlace a Google Maps tiene que seguir el recorrido completo. */
   const camino = [DATOS.baruk, ...ru.paradas.map(p => p.punto),
-                  ...ru.retiros.map(x => x.proveedor), DATOS.baruk]
+                  ...(ru.retiros || []).map(x => x.proveedor), DATOS.baruk]
     .map(p => p.lat + ',' + p.lon).join('/');
   html = html.replace(/href="https:\/\/www\.google\.com\/maps\/dir\/[^"]*"/,
                       `href="https://www.google.com/maps/dir/${camino}"`);
