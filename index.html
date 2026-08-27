@@ -463,6 +463,16 @@ async function dbGuardarProveedor(id, datos) {
   return insertar('proveedores', fila);
 }
 
+/* Alta y edición de puntos de entrega. La fila viene armada desde la pantalla:
+   así el formulario decide si toca o no la ubicación, y una edición de dirección
+   no pisa una coordenada que alguien ya confirmó a mano. */
+async function dbGuardarPunto(id, fila) {
+  if (id) return modificar('puntos_entrega', 'id=eq.' + encodeURIComponent(id), fila);
+  const usados = DATOS.puntos.concat(DATOS.sinCoord || [])
+    .reduce((m, p) => Math.max(m, +String(p.id).replace(/\D/g, '') || 0), 0);
+  return insertar('puntos_entrega', { ...fila, id: 'PE' + String(usados + 1).padStart(3, '0') });
+}
+
 /* Las ubicaciones corregidas a mano quedan marcadas como tales:
    así se distingue lo que confirmó una persona de lo que adivinó un geocodificador. */
 async function dbGuardarUbicacion(id, lat, lon) {
@@ -2281,6 +2291,203 @@ function dibujarUbMapa() {
   });
   if (b.length > 1) map.fitBounds(b, { padding: [30, 30] });
   setTimeout(() => map.invalidateSize(), 120);
+}
+
+/* =========================================================
+   Puntos de entrega: buscador, alta y edición.
+   Estas definiciones van después de las originales y las reemplazan.
+   ========================================================= */
+
+const etiquetaPunto = p =>
+  `${p.id} · ${p.transporte || p.nombre} · ${p.dir}${p.loc ? ' · ' + p.loc : ''}`;
+
+function textoBuscablePunto(p) {
+  return sinTildes([p.id, p.nombre, p.transporte, p.dir, p.loc, p.partido,
+                    p.provincia, p.zona, p.nota].filter(Boolean).join(' '));
+}
+
+const TIPOS_PUNTO = ['CLIENTE', 'TRANSPORTE', 'DEPOSITO'];
+
+/* ---------------------------------------------------------------- listado */
+function puntos() {
+  const revisar = DATOS.puntos.filter(p => p.estado && !p.estado.startsWith('OK'));
+  $('#vista').innerHTML = `
+  <div class="top"><div><h1>Puntos de entrega</h1><p>${DATOS.puntos.length} lugares físicos donde para el camión</p></div>
+    <div class="row no-print">
+      <input type="text" id="qp" style="min-width:270px" placeholder="Buscar por dirección, transporte o localidad…">
+      <button class="btn" onclick="irA('ubicaciones')">Corregir ubicaciones</button>
+      ${puedeEditar() ? '<button class="btn pri" onclick="editarPunto()">+ Agregar punto</button>' : ''}
+    </div></div>
+  <p class="mini no-print" id="qpCuenta" style="margin:-6px 0 10px"></p>
+  ${revisar.length || DATOS.sinCoord.length ? `<div class="aviso">Hay <b>${revisar.length + DATOS.sinCoord.length} puntos</b> con la ubicación sin confirmar. Se corrigen arrastrando el pin sobre el mapa, en «Corregir ubicaciones».</div>` : ''}
+  <div class="panel" style="padding:0"><div class="tabla-wrap"><table>
+    <thead><tr><th>ID</th><th>Transporte / nombre</th><th>Dirección</th><th>Zona</th><th class="num">Clientes</th><th>Recibe</th><th>Estado</th><th class="no-print"></th></tr></thead>
+    <tbody id="tbp"></tbody></table></div></div>`;
+
+  const pintar = (q = '') => {
+    const partes = sinTildes(q).split(/\s+/).filter(Boolean);
+    const hallados = DATOS.puntos.filter(p => {
+      if (!partes.length) return true;
+      const t = textoBuscablePunto(p);
+      return partes.every(x => t.includes(x));
+    });
+    const cuenta = $('#qpCuenta');
+    if (cuenta) cuenta.textContent = !partes.length ? ''
+      : hallados.length === 1 ? '1 punto encontrado' : `${hallados.length} puntos encontrados`;
+    $('#tbp').innerHTML = hallados.map(p => {
+      const n = DATOS.clientes.filter(c => c.punto === p.id).length;
+      const ok = (p.estado || '').startsWith('OK');
+      return `<tr><td>${esc(p.id)}</td><td><b>${esc(p.transporte || p.nombre)}</b></td>
+        <td>${esc(p.dir)}<br><span class="mini">${esc(p.loc || p.partido)}</span></td><td class="mini">${esc(p.zona)}</td>
+        <td class="num"><b>${n}</b></td>
+        <td class="mini">${p.ventanas ? esc(textoVentanas(p.ventanas)) : '—'}</td>
+        <td><span class="badge ${ok ? 'b-cl' : 'b-al'}">${ok ? 'OK' : 'A revisar'}</span>${p.nota ? `<div class="mini">${esc(p.nota)}</div>` : ''}</td>
+        <td class="no-print">${puedeEditar() ? `<button class="btn sm" onclick="editarPunto('${esc(p.id)}')">Editar</button>` : ''}</td></tr>`;
+    }).join('');
+    envolverTablas();
+  };
+  pintar();
+  $('#qp').oninput = e => pintar(e.target.value);
+}
+
+/* ---------------------------------------------------------------- alta y edición */
+/* Si se llega desde el formulario de cliente, se guarda lo que ya venía escrito
+   para no perderlo y se vuelve ahí con el punto nuevo ya elegido. */
+let VOLVER_A_CLIENTE = null;
+
+function editarPunto(id, desdeCliente) {
+  if (!puedeEditar()) return alert('Tu usuario es de sólo lectura.');
+  const p = id ? DATOS.puntos.find(x => x.id === id)
+               : { id: '', nombre: '', transporte: '', tipo: 'TRANSPORTE', dir: '', loc: '',
+                   partido: '', provincia: 'Buenos Aires', zona: '', lat: '', lon: '' };
+  if (!p) return;
+  if (desdeCliente) {
+    VOLVER_A_CLIENTE = {
+      id: $('#dlgT').dataset.cliente || '',
+      nombre: $('#clNombre') ? $('#clNombre').value : '',
+      tipo: $('#clTipo') ? $('#clTipo').value : 'CLIENTE',
+      modo: $('#clModo') ? $('#clModo').value : 'SIN DATO',
+      orden: $('#clOrden') ? $('#clOrden').value : 'SIN RESTRICCION',
+      regla: $('#clRegla') ? $('#clRegla').value : ''
+    };
+    $('#dlg').close();
+  }
+  const zonas = [...new Set(DATOS.puntos.map(x => x.zona).filter(Boolean))].sort();
+  $('#dlgT').textContent = id ? 'Editar punto de entrega · ' + p.id : 'Nuevo punto de entrega';
+  $('#dlgB').innerHTML = `
+    <div class="campo"><label>Transporte (si la entrega es en un transporte)</label>
+      <input id="ptTr" value="${esc(p.transporte || '')}" placeholder="Ej: TRANSPORTE RAOSA"></div>
+    <div class="campo"><label>Nombre del lugar</label>
+      <input id="ptNom" value="${esc(p.nombre)}" placeholder="Cómo lo reconocen en planta"></div>
+    <div class="campo"><label>Dirección</label>
+      <input id="ptDir" value="${esc(p.dir)}" placeholder="Calle y altura, nave, módulo…"></div>
+    <div class="row">
+      <div class="campo" style="flex:1"><label>Localidad / barrio</label><input id="ptLoc" value="${esc(p.loc || '')}"></div>
+      <div class="campo" style="flex:1"><label>Partido / comuna</label><input id="ptPar" value="${esc(p.partido || '')}"></div>
+    </div>
+    <div class="row">
+      <div class="campo" style="flex:1"><label>Provincia</label><input id="ptProv" value="${esc(p.provincia || '')}"></div>
+      <div class="campo" style="flex:1"><label>Tipo</label><select id="ptTipo">${
+        TIPOS_PUNTO.map(t => `<option ${p.tipo === t ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+    </div>
+    <div class="campo"><label>Zona de reparto</label>
+      <input id="ptZona" list="listaZonas" value="${esc(p.zona || '')}" autocomplete="off">
+      <datalist id="listaZonas">${zonas.map(z => `<option value="${esc(z)}">`).join('')}</datalist></div>
+    <div class="row">
+      <div class="campo" style="flex:1"><label>Latitud</label><input id="ptLat" value="${p.lat != null ? p.lat : ''}" placeholder="-34.6…"></div>
+      <div class="campo" style="flex:1"><label>Longitud</label><input id="ptLon" value="${p.lon != null ? p.lon : ''}" placeholder="-58.4…"></div>
+    </div>
+    <p class="mini" style="margin:-4px 0 8px">En Google Maps: click derecho sobre el lugar exacto y se copian los dos números.
+    Si no las tenés a mano, dejalas vacías y después arrastrás el pin en «Corregir ubicaciones».</p>`;
+  $('#dlgOk').onclick = async () => {
+    const dir = $('#ptDir').value.trim();
+    const tr = $('#ptTr').value.trim();
+    const nom = $('#ptNom').value.trim() || tr || dir;
+    if (!dir) return alert('La dirección no puede quedar vacía.');
+    const lat = parseFloat($('#ptLat').value), lon = parseFloat($('#ptLon').value);
+    const hayCoord = !isNaN(lat) && !isNaN(lon);
+    const cambio = hayCoord && (id ? (lat !== p.lat || lon !== p.lon) : true);
+
+    const fila = {
+      nombre: nom, transporte: tr || null, tipo: $('#ptTipo').value,
+      direccion: dir, localidad: $('#ptLoc').value.trim() || null,
+      partido: $('#ptPar').value.trim() || null, provincia: $('#ptProv').value.trim() || null,
+      zona: $('#ptZona').value.trim() || null
+    };
+    if (cambio) {
+      fila.latitud = lat; fila.longitud = lon;
+      fila.precision_geo = 'MANUAL';
+      fila.estado = 'OK - confirmada a mano';
+    } else if (!id && !hayCoord) {
+      fila.estado = 'REVISAR - falta la ubicación';
+    }
+
+    try {
+      const guardado = (await dbGuardarPunto(id, fila))[0];
+      DATOS = await cargarTodo();
+      const nuevoId = id || (guardado && guardado.id);
+      if (VOLVER_A_CLIENTE) {
+        const previo = { ...VOLVER_A_CLIENTE, punto: nuevoId };
+        VOLVER_A_CLIENTE = null;
+        setTimeout(() => editarCliente(previo.id || null, previo), 0);
+      } else {
+        setTimeout(() => { puntos(); }, 0);
+      }
+    } catch (e) { alert('No se pudo guardar el punto.\n\n' + mensajeError(e)); }
+  };
+  $('#dlg').showModal();
+}
+
+/* ---------------------------------------------------------------- cliente */
+function editarCliente(id, previo) {
+  const base = id ? DATOS.clientes.find(x => x.id === id)
+                  : { id: '', nombre: '', punto: '', tipoEntrega: 'CLIENTE', modo: 'SIN DATO',
+                      orden: 'SIN RESTRICCION', turno: false, regla: '' };
+  if (!base) return;
+  const c = previo ? { ...base, ...previo } : base;
+  const elegido = c.punto ? DATOS.puntos.find(x => x.id === c.punto) : null;
+
+  $('#dlgT').textContent = id ? 'Editar cliente · ' + id : 'Agregar cliente';
+  $('#dlgT').dataset.cliente = id || '';
+  $('#dlgB').innerHTML = `
+    <div class="campo"><label>Razón social</label><input id="clNombre" value="${esc(c.nombre)}"></div>
+    <div class="campo"><label>Punto de entrega</label>
+      <input id="clPunto" list="listaPuntos" autocomplete="off"
+             value="${elegido ? esc(etiquetaPunto(elegido)) : ''}"
+             placeholder="Escribí calle, transporte o localidad y elegí de la lista…">
+      <datalist id="listaPuntos">${DATOS.puntos.map(p => `<option value="${esc(etiquetaPunto(p))}">`).join('')}</datalist>
+      <div class="row" style="margin-top:6px;align-items:center">
+        <button class="btn sm" type="button" onclick="editarPunto(null, true)">+ Crear un punto nuevo</button>
+        <span class="mini">Si el cliente retira, dejalo vacío.</span>
+      </div>
+    </div>
+    <div class="row"><div class="campo" style="flex:1"><label>Tipo de entrega</label><select id="clTipo"><option ${c.tipoEntrega === 'CLIENTE' ? 'selected' : ''}>CLIENTE</option><option ${c.tipoEntrega === 'TRANSPORTE' ? 'selected' : ''}>TRANSPORTE</option><option ${c.tipoEntrega === 'RETIRA EL CLIENTE' ? 'selected' : ''}>RETIRA EL CLIENTE</option></select></div>
+      <div class="campo" style="flex:1"><label>Modo de carga</label><select id="clModo"><option ${c.modo === 'PALLET' ? 'selected' : ''}>PALLET</option><option ${c.modo === 'GRANEL' ? 'selected' : ''}>GRANEL</option><option ${c.modo === 'MIXTO' ? 'selected' : ''}>MIXTO</option><option ${c.modo === 'SIN DATO' ? 'selected' : ''}>SIN DATO</option></select></div></div>
+    <div class="campo"><label>Orden obligatorio</label><select id="clOrden"><option ${c.orden === 'SIN RESTRICCION' ? 'selected' : ''}>SIN RESTRICCION</option><option ${c.orden === 'ULTIMA ENTREGA' ? 'selected' : ''}>ULTIMA ENTREGA</option><option ${c.orden === 'PRIMERA' ? 'selected' : ''}>PRIMERA</option></select></div>
+    <div class="campo"><label>Regla de entrega</label><input id="clRegla" value="${esc(c.regla || '')}" placeholder="Ej: recibe hasta las 13, nave B módulo 56…"></div>
+    <p class="mini" style="margin:-2px 0 0">Queda registrado quién hizo el cambio y cuándo.</p>`;
+
+  $('#dlgOk').onclick = async () => {
+    const nombre = $('#clNombre').value.trim();
+    if (!nombre) return alert('La razón social no puede quedar vacía.');
+    const txt = $('#clPunto').value.trim();
+    let idPunto = null;
+    if (txt) {
+      const m = txt.match(/^(PE\d+)/i);
+      idPunto = m ? m[1].toUpperCase() : null;
+      if (!idPunto || !DATOS.puntos.some(p => p.id === idPunto))
+        return alert('Ese punto de entrega no existe.\n\nEmpezá a escribir la calle o el transporte y elegí una opción de la lista, o creá uno nuevo.');
+    }
+    try {
+      await dbGuardarCliente(id, {
+        nombre, punto: idPunto, tipoEntrega: $('#clTipo').value, modo: $('#clModo').value,
+        orden: $('#clOrden').value, turno: c.turno, regla: $('#clRegla').value.trim()
+      });
+      DATOS = await cargarTodo();
+      setTimeout(() => { clientes(); envolverTablas(); }, 0);
+    } catch (e) { alert('No se pudo guardar.\n\n' + mensajeError(e)); }
+  };
+  $('#dlg').showModal();
 }
 </script>
 </body>
