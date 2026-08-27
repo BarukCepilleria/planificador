@@ -511,6 +511,7 @@ async function dbGuardarHoja(r, ESTADO) {
   r.rutas.forEach(ru => (ru.retiros || []).forEach(x => paradas.push({
     hoja_id: hoja.id, ruta_nro: entero(ru.nro), orden: 100 + x.n,
     punto_id: null, proveedor_id: x.proveedor.id, tipo_visita: 'RETIRO',
+    pallets_materia_prima: null,
     km_tramo: x.km != null ? Number(x.km).toFixed(1) : null,
     minutos_tramo: entero(x.min), minutos_servicio: entero(x.servicio),
     hora_estimada: x.llegada || null,
@@ -525,6 +526,7 @@ async function dbGuardarHoja(r, ESTADO) {
       punto_id: prov ? null : p.punto.id,
       proveedor_id: prov ? prov.id : null,
       tipo_visita: prov ? (p.punto.modoProveedor || 'ENTREGA') : null,
+      pallets_materia_prima: prov ? entero(p.punto.palletsProveedor) : null,
       km_tramo: p.km != null ? Number(p.km).toFixed(1) : null,
       minutos_tramo: entero(p.min),
       minutos_servicio: entero(p.servicio),
@@ -882,11 +884,13 @@ const llevaCarga = p => modoProveedor(p) !== 'RETIRO';
 
 function puntoDeProveedor(prov) {
   const v = ventanaProveedor(prov.horario);
+  const pal = Math.max(0, Math.round(Number(prov.pallets) || 0));
   return {
     id: 'PROV:' + prov.id, nombre: prov.nombre, transporte: null, tipo: 'PROVEEDOR',
     dir: prov.dir, loc: prov.loc, partido: '', provincia: '', zona: 'Proveedores',
     lat: prov.lat, lon: prov.lon, ventanas: v, estado: 'OK',
-    esProveedor: true, proveedor: prov, modoProveedor: modoProveedor(prov)
+    esProveedor: true, proveedor: prov, modoProveedor: modoProveedor(prov),
+    palletsProveedor: pal
   };
 }
 
@@ -1131,6 +1135,30 @@ async function planificar(opts) {
   rutas.forEach(r => {
     const pedidos = r.paradas.flatMap(p => p.pedidos);
     r.carga = ocupacion(pedidos, vehiculo, cajasPorPallet);
+
+    /* La materia prima que se le lleva a un proveedor viaja en pallets desde BARUK,
+       así que ocupa posiciones igual que un pedido. Se suma acá y no dentro de
+       ocupacion() porque no es un pedido de nadie: no tiene cliente ni cajas. */
+    const palMP = r.paradas.reduce((s, p) =>
+      s + (p.punto.esProveedor ? (p.punto.palletsProveedor || 0) : 0), 0);
+    r.palletsMateriaPrima = palMP;
+    if (palMP) {
+      r.carga.pallets += palMP;
+      r.carga.usoPallets = vehiculo.pallets ? r.carga.pallets / vehiculo.pallets : 0;
+      r.carga.uso = r.carga.usoPallets + r.carga.usoCajas;
+    }
+  });
+
+  // Aviso de camión pasado de carga (antes no existía y con la materia prima hace falta).
+  rutas.forEach(r => {
+    if (r.carga.uso <= 1) return;
+    const mp = r.palletsMateriaPrima
+      ? ` Ahí van ${r.palletsMateriaPrima} pallet${r.palletsMateriaPrima === 1 ? '' : 's'} de materia prima.` : '';
+    avisos.push({
+      tipo: 'carga',
+      texto: `${rutas.length > 1 ? 'Ruta ' + r.nro + ': ' : ''}la carga da ${(r.carga.uso * 100).toFixed(0)}% del camión, ` +
+             `no entra.${mp} Sacá alguna parada o usá un vehículo más grande.`
+    });
   });
 
   /* 8. Retiros en proveedores.
@@ -1144,9 +1172,7 @@ async function planificar(opts) {
       tipo: 'proveedor',
       texto: `${puntosProv.length === 1 ? 'La parada en' : 'Las paradas en'} ${nom} ${puntosProv.length === 1 ? 'es' : 'son'} ` +
              `con materia prima que sale de BARUK, así que ${puntosProv.length === 1 ? 'va' : 'van'} intercalada${puntosProv.length === 1 ? '' : 's'} ` +
-             `entre las entregas, donde menos kilómetros cuesta. ` +
-             `Ojo: el lugar que ocupa esa materia prima en el camión no está contado en la carga, ` +
-             `porque no tenemos cargadas sus cajas.`
+             `entre las entregas, donde menos kilómetros cuesta.`
     });
   }
   if (retiros && retiros.length && rutas.length) {
@@ -2684,7 +2710,10 @@ function editarCliente(id, previo) {
                misma visita. Va como entrega: el hueco lo deja la propia
                materia prima que se descarga ahí.
    ========================================================= */
-ESTADO.retiros = new Map();   // id de proveedor -> 'RETIRO' | 'ENTREGA' | 'AMBAS'
+/* id de proveedor -> { modo, pallets }
+   pallets = posiciones que ocupa la materia prima que sale de BARUK
+   (bolsones de plástico palletizados). En un retiro puro no aplica. */
+ESTADO.retiros = new Map();
 
 const MODOS_VISITA = [
   ['RETIRO',  'Retiro mercadería'],
@@ -2692,6 +2721,7 @@ const MODOS_VISITA = [
   ['AMBAS',   'Le llevo y retiro']
 ];
 const textoModoVisita = m => (MODOS_VISITA.find(x => x[0] === m) || MODOS_VISITA[0])[1];
+const visitaDe = id => ESTADO.retiros.get(id) || { modo: 'RETIRO', pallets: 0 };
 
 function contarRetiros() {
   const n = $('#retirosCuenta');
@@ -2706,31 +2736,62 @@ function pintarRetiros() {
   const sin = DATOS.proveedores.length - provs.length;
   caja.innerHTML = provs.map(p => {
     const elegido = ESTADO.retiros.has(p.id);
-    const modo = elegido ? ESTADO.retiros.get(p.id) : 'RETIRO';
+    const v = visitaDe(p.id);
     return `
     <div class="fila-prov" style="display:flex;gap:9px;align-items:flex-start;padding:7px 0;border-top:1px solid var(--linea)">
       <input type="checkbox" data-prov="${esc(p.id)}" ${elegido ? 'checked' : ''} style="margin-top:4px;cursor:pointer">
-      <div style="flex:1">
+      <div style="flex:1;min-width:150px">
         <b>${esc(p.nombre)}</b><br>
         <span class="mini">${esc(p.dir)}${p.loc ? ' · ' + esc(p.loc) : ''}${p.horario ? ' · recibe ' + esc(p.horario) : ''}</span>
       </div>
-      <select data-modo="${esc(p.id)}" ${elegido ? '' : 'disabled'} style="max-width:210px">
-        ${MODOS_VISITA.map(([v, t]) => `<option value="${v}" ${modo === v ? 'selected' : ''}>${t}</option>`).join('')}
+      <select data-modo="${esc(p.id)}" ${elegido ? '' : 'disabled'} style="max-width:200px">
+        ${MODOS_VISITA.map(([m, t]) => `<option value="${m}" ${v.modo === m ? 'selected' : ''}>${t}</option>`).join('')}
       </select>
+      <label class="mini" data-pal-caja="${esc(p.id)}"
+             style="display:${elegido && v.modo !== 'RETIRO' ? 'flex' : 'none'};align-items:center;gap:5px;white-space:nowrap">
+        <input type="number" min="0" step="1" data-pal="${esc(p.id)}" value="${v.pallets || 1}" style="width:58px;text-align:right">
+        pallets
+      </label>
     </div>`;
   }).join('') +
     (sin ? `<p class="mini" style="margin:8px 0 0;color:var(--rojo)">${sin} proveedor${sin === 1 ? '' : 'es'} sin ubicación: no se puede calcular el camino hasta ahí.</p>` : '');
 
+  const palletsDe = id => {
+    const inp = caja.querySelector(`input[data-pal="${CSS.escape(id)}"]`);
+    const n = inp ? parseInt(inp.value, 10) : 1;
+    return isNaN(n) || n < 0 ? 0 : n;
+  };
+  const verPallets = (id, modo) => {
+    const lbl = caja.querySelector(`label[data-pal-caja="${CSS.escape(id)}"]`);
+    if (lbl) lbl.style.display = modo !== 'RETIRO' ? 'flex' : 'none';
+  };
+
   caja.querySelectorAll('input[data-prov]').forEach(ch => ch.onchange = e => {
     const id = e.target.dataset.prov;
     const sel = caja.querySelector(`select[data-modo="${CSS.escape(id)}"]`);
-    if (e.target.checked) { ESTADO.retiros.set(id, sel ? sel.value : 'RETIRO'); if (sel) sel.disabled = false; }
-    else { ESTADO.retiros.delete(id); if (sel) sel.disabled = true; }
+    const modo = sel ? sel.value : 'RETIRO';
+    if (e.target.checked) {
+      ESTADO.retiros.set(id, { modo, pallets: modo === 'RETIRO' ? 0 : palletsDe(id) });
+      if (sel) sel.disabled = false;
+      verPallets(id, modo);
+    } else {
+      ESTADO.retiros.delete(id);
+      if (sel) sel.disabled = true;
+      verPallets(id, 'RETIRO');
+    }
     contarRetiros();
   });
   caja.querySelectorAll('select[data-modo]').forEach(sl => sl.onchange = e => {
-    const id = e.target.dataset.modo;
-    if (ESTADO.retiros.has(id)) ESTADO.retiros.set(id, e.target.value);
+    const id = e.target.dataset.modo, modo = e.target.value;
+    if (!ESTADO.retiros.has(id)) return;
+    ESTADO.retiros.set(id, { modo, pallets: modo === 'RETIRO' ? 0 : palletsDe(id) });
+    verPallets(id, modo);
+  });
+  caja.querySelectorAll('input[data-pal]').forEach(inp => inp.oninput = e => {
+    const id = e.target.dataset.pal;
+    if (!ESTADO.retiros.has(id)) return;
+    const v = ESTADO.retiros.get(id);
+    if (v.modo !== 'RETIRO') ESTADO.retiros.set(id, { modo: v.modo, pallets: palletsDe(id) });
   });
 }
 
@@ -2762,7 +2823,7 @@ generar = async function () {
     seleccion: seleccionados(), datos: DATOS, vehiculo: v,
     horaSalida: ESTADO.salida, minutosJornada: ESTADO.jornada,
     retiros: DATOS.proveedores.filter(p => ESTADO.retiros.has(p.id) && p.lat != null)
-                              .map(p => ({ ...p, modo: ESTADO.retiros.get(p.id) })),
+                              .map(p => ({ ...p, ...visitaDe(p.id) })),
     onEstado: t => btn.textContent = t
   });
   btn.disabled = false; btn.textContent = 'GENERAR HOJA DE RUTA';
@@ -2794,11 +2855,21 @@ bloqueRuta = function (ru, varias) {
       if (!tr) return;
       const td = tr.children;
       const modo = p.punto.modoProveedor || 'ENTREGA';
-      td[1].innerHTML = `<span class="mini">${modo === 'AMBAS'
-        ? 'se le deja materia prima y se retira producto' : 'se le deja materia prima'}</span>`;
+      const pal = p.punto.palletsProveedor || 0;
+      const carga = pal ? `${pal} pallet${pal === 1 ? '' : 's'} de materia prima` : 'materia prima';
+      td[1].innerHTML = `<span class="mini">se le deja ${carga}${modo === 'AMBAS' ? ' y se retira producto' : ''}</span>`;
       td[4].innerHTML = `<span class="badge b-pal">${modo === 'AMBAS' ? 'Materia prima y retiro' : 'Materia prima'}</span>`;
       tr.style.background = 'rgba(240,138,0,.07)';
     });
+
+    /* En el resumen, aclarar cuántas posiciones se van en materia prima: si no,
+       el porcentaje de ocupación no se entiende. */
+    if (ru.palletsMateriaPrima) {
+      const celdas = [...cont.querySelectorAll('td')];
+      const i = celdas.findIndex(td => td.textContent.trim() === 'Ocupación del camión');
+      if (i >= 0 && celdas[i + 1]) celdas[i + 1].innerHTML =
+        `<b>${(ru.carga.uso * 100).toFixed(0)}%</b><br><span class="mini">incluye ${ru.palletsMateriaPrima} pallet${ru.palletsMateriaPrima === 1 ? '' : 's'} de materia prima</span>`;
+    }
     html = cont.innerHTML;
   }
 
