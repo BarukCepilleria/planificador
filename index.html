@@ -414,7 +414,8 @@ async function cargarTodo() {
 
     vehiculos: veh.map(v => ({
       id: v.id, pallets: Number(v.posiciones_pallet),
-      cajas: v.cajas_granel, cajasPallet: v.cajas_palletizado
+      cajas: v.cajas_granel, cajasPallet: v.cajas_palletizado,
+      m3: v.metros_cubicos != null ? Number(v.metros_cubicos) : null
     })),
 
     proveedores: prv.map(p => ({
@@ -2070,7 +2071,7 @@ function editarProveedor(id) {
 `;
   $('#dlgOk').onclick = async () => {
     const nombre = $('#pvN').value.trim();
-    if (!nombre) return;
+    if (!nombre) return alert('El nombre del proveedor no puede quedar vacío.');
     const lat = parseFloat($('#pvLat').value), lon = parseFloat($('#pvLon').value);
     const datos = { nombre, dir: $('#pvD').value.trim(), loc: $('#pvL').value.trim(),
                     horario: $('#pvH').value.trim(), frec: $('#pvF').value.trim(),
@@ -2147,8 +2148,8 @@ function config() {
   $('#vista').innerHTML = `
   <div class="top"><div><h1>Configuración</h1><p>Los parámetros con los que la app calcula</p></div></div>
   <div class="panel"><h3>Vehículos</h3>
-    <table><thead><tr><th>Móvil</th><th class="num">Posiciones de pallet</th><th class="num">Cajas a granel</th><th class="num">Cajas si va todo palletizado</th><th class="num">Lo que cuesta palletizar</th></tr></thead>
-    <tbody>${DATOS.vehiculos.map(v => `<tr><td><b>${esc(v.id)}</b></td><td class="num">${v.pallets}</td><td class="num">${num(v.cajas)}</td><td class="num">${num(v.cajasPallet)}</td><td class="num">${v.cajas > v.cajasPallet ? '−' + Math.round((1 - v.cajasPallet / v.cajas) * 100) + '%' : '—'}</td></tr>`).join('')}</tbody></table>
+    <table><thead><tr><th>Móvil</th><th class="num">Volumen de caja</th><th class="num">Posiciones de pallet</th><th class="num">Cajas a granel</th><th class="num">Cajas si va todo palletizado</th><th class="num">Lo que cuesta palletizar</th></tr></thead>
+    <tbody>${DATOS.vehiculos.map(v => `<tr><td><b>${esc(v.id)}</b></td><td class="num">${v.m3 != null ? num(v.m3) + ' m&sup3;' : '—'}</td><td class="num">${v.pallets}</td><td class="num">${num(v.cajas)}</td><td class="num">${num(v.cajasPallet)}</td><td class="num">${v.cajas > v.cajasPallet ? '−' + Math.round((1 - v.cajasPallet / v.cajas) * 100) + '%' : '—'}</td></tr>`).join('')}</tbody></table>
     <p class="mini" style="margin-top:10px">Una carga entra si <b>(pallets usados ÷ posiciones) + (cajas sueltas ÷ capacidad a granel) ≤ 1</b>. Un pallet equivale a ${DATOS.jornada.cajasPorPallet} cajas en promedio.</p>
   </div>
   <div class="panel"><h3>Jornada</h3>
@@ -2429,7 +2430,7 @@ function pegarCoordenadas(id) {
   $('#dlgOk').onclick = () => {
     const t = $('#ubCoord').value.trim();
     const m = t.match(/(-?\d+[.,]\d+)[\s,;]+(-?\d+[.,]\d+)/);
-    if (!m) return;
+    if (!m) return alert('No pude leer las coordenadas.\n\nTienen que ser dos numeros separados por coma, como -34.799314, -58.271669.');
     const lat = parseFloat(m[1].replace(',', '.')), lon = parseFloat(m[2].replace(',', '.'));
     if (lat < -56 || lat > -21 || lon < -74 || lon > -53) {
       alert('Esas coordenadas caen fuera de Argentina. Fijate que el primero sea la latitud (cerca de -34) y el segundo la longitud (cerca de -58).');
@@ -2911,6 +2912,63 @@ dibujarMapa = function (r) {
     }).addTo(window.__mapa).bindPopup(`<b>${esc(x.proveedor.nombre)}</b><br>Retiro · ${esc(x.proveedor.dir)}`);
   }));
 };
+
+/* =========================================================
+   Que el diálogo no se cierre solo y no se pierda lo escrito.
+
+   El problema: los botones viven dentro de un <form method="dialog">, así que
+   CUALQUIER click en "Guardar" cerraba el diálogo, aunque la validación fallara
+   o la base devolviera un error. El manejador alcanzaba a mostrar el aviso, pero
+   para cuando lo leías el formulario ya se había vaciado y había que cargar todo
+   de nuevo. Lo mismo pasaba al apretar Enter dentro de un campo.
+
+   La solución: los botones dejan de enviar el formulario. El diálogo se cierra
+   solamente cuando el guardado terminó bien. Se considera que NO terminó bien si
+   el manejador devuelve false o si mostró algún cartel de aviso.
+   ========================================================= */
+(function blindarDialogo() {
+  const dlg = document.getElementById('dlg');
+  const btn = document.getElementById('dlgOk');
+  if (!dlg || !btn) return;
+  const form = dlg.querySelector('form');
+  const cerrar = form ? [...form.querySelectorAll('button')].find(b => b !== btn) : null;
+
+  btn.type = 'button';
+  if (cerrar) { cerrar.type = 'button'; cerrar.onclick = () => dlg.close(); }
+
+  // Cualquier alert que salga durante el guardado cuenta como "no se guardó".
+  let huboAviso = false;
+  const alertaOriginal = window.alert.bind(window);
+  window.alert = function (m) { huboAviso = true; return alertaOriginal(m); };
+
+  // Los manejadores se siguen asignando con $('#dlgOk').onclick = ...
+  let manejador = null;
+  Object.defineProperty(btn, 'onclick', {
+    configurable: true,
+    get() { return manejador; },
+    set(f) { manejador = f; }
+  });
+
+  btn.addEventListener('click', async () => {
+    if (!manejador) { dlg.close(); return; }
+    huboAviso = false;
+    const rotulo = btn.textContent;
+    btn.disabled = true;
+    try {
+      const r = await manejador();
+      if (r !== false && !huboAviso) dlg.close();
+    } catch (e) {
+      // Un error inesperado tampoco tiene que vaciar el formulario.
+      alertaOriginal('No se pudo guardar.\n\n' + ((e && e.message) || e));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = rotulo;
+    }
+  });
+
+  // Enter dentro de un campo: guarda, no cierra a lo bruto.
+  if (form) form.addEventListener('submit', e => { e.preventDefault(); btn.click(); });
+})();
 </script>
 </body>
 </html>
