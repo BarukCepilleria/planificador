@@ -3155,9 +3155,10 @@ cargarPedido = function (idCliente) {
       if (!p || !p.unidadesPorCaja) {
         return `<tr style="background:rgba(240,138,0,.07)">
           <td class="num">${l.cantidad}</td>
-          <td>${esc(l.nombre)}
+          <td><b>${esc(l.nombre)}</b>
+            <div class="mini" style="margin-top:4px">Este nombre no lo tengo. <b>¿Qué producto del catálogo es?</b></div>
             <div class="row" style="margin-top:5px;align-items:center;gap:6px">
-              <input list="listaCatalogo" data-fila="${i}" placeholder="¿cuál es? escribí y elegí de la lista…" style="min-width:230px">
+              <input list="listaCatalogo" data-fila="${i}" placeholder="escribí parte del nombre y elegilo de la lista" style="min-width:280px">
             </div></td>
           <td class="num">—</td>
           <td class="num"><span class="badge b-al">no lo reconozco</span></td></tr>`;
@@ -3180,7 +3181,8 @@ cargarPedido = function (idCliente) {
         <tfoot><tr><td colspan="3" style="text-align:right"><b>Total</b></td><td class="num"><b>${total}</b></td></tr></tfoot>
       </table></div>
       ${sinResolver.length ? `<div class="aviso div" style="margin-top:10px"><b>${sinResolver.length} línea${sinResolver.length > 1 ? 's' : ''} sin resolver.</b>
-        Elegí el producto en el recuadro de cada una. Esas líneas todavía no se están contando, así que el total está incompleto.</div>` : ''}
+        En el recuadro de cada una decime <b>qué producto del catálogo es</b> — no la caja, el producto.
+        Esas líneas todavía no se están contando, así que el total está incompleto.</div>` : ''}
       ${porGuardar && puedeEditar() ? `<label class="mini" style="display:flex;gap:7px;align-items:center;margin-top:10px">
         <input type="checkbox" id="pedRecordar" checked>
         Guardar ${porGuardar === 1 ? 'el nombre que elegiste' : 'los ' + porGuardar + ' nombres que elegiste'}, para que la próxima vez los reconozca solo</label>` : ''}
