@@ -386,7 +386,7 @@ async function cargarTodo() {
     leer('proveedores?select=*&activo=is.true&order=id'),
     leer('productos?select=*&activo=is.true&order=id'),
     leer('motivos_no_entrega?select=motivo&activo=is.true&order=orden'),
-    leer('alias_producto?select=alias,producto_id,origen')
+    leer('alias_producto?select=alias,producto_id,origen,unidades_por_caja')
   ]);
 
   const base = pts.find(p => p.id === 'BARUK');
@@ -432,7 +432,12 @@ async function cargarTodo() {
     /* Los mismos productos salen en la factura con otros nombres: la marca
        Sánchez usa los nombres viejos y la cadena PP les pone su propio prefijo.
        Esta tabla es la que evita que el conversor de pedidos no los reconozca. */
-    alias: (ali || []).map(a => ({ alias: a.alias, productoId: a.producto_id, origen: a.origen })),
+    alias: (ali || []).map(a => ({
+      alias: a.alias, productoId: a.producto_id, origen: a.origen,
+      // Algunos alias traen su propia cantidad por caja: a la cadena PP el
+      // cepillo de piso le va de a 8 y no de a 24 como al resto.
+      unidadesPorCaja: a.unidades_por_caja
+    })),
 
     motivosNoEntrega: mot.map(m => m.motivo),
     jornada: JORNADA_FIJA
@@ -2990,11 +2995,17 @@ const normalizarAlias = s => sinAcentos(s).replace(/[^A-Z0-9]+/g, ' ').trim();
 function productoPorAlias(nombre) {
   const n = normalizarAlias(nombre);
   if (!n || !DATOS.alias || !DATOS.alias.length) return null;
-  const dePorId = id => DATOS.catalogo.find(c => c.id === id) || null;
+  /* Si el alias trae su propia cantidad por caja, pisa la del catálogo:
+     el mismo producto puede venir en cajas distintas según el cliente. */
+  const dePorId = (id, a) => {
+    const p = DATOS.catalogo.find(c => c.id === id);
+    if (!p) return null;
+    return a && a.unidadesPorCaja ? { ...p, unidadesPorCaja: a.unidadesPorCaja, alias: a.alias } : p;
+  };
 
   // 1. El nombre es exactamente un alias conocido.
   const exacto = DATOS.alias.find(a => a.alias === n);
-  if (exacto) return dePorId(exacto.productoId);
+  if (exacto) return dePorId(exacto.productoId, exacto);
 
   // 2. El nombre arranca con un alias y sigue con otra cosa: casi siempre es
   //    el nombre del cliente pegado atrás. Gana el alias más largo, para que
@@ -3006,7 +3017,7 @@ function productoPorAlias(nombre) {
       if (!mejor || a.alias.length > mejor.alias.length) mejor = a;
     }
   }
-  return mejor ? dePorId(mejor.productoId) : null;
+  return mejor ? dePorId(mejor.productoId, mejor) : null;
 }
 
 const buscarProductoOriginal = buscarProducto;
