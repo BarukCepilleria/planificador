@@ -495,6 +495,17 @@ async function dbGuardarUbicacion(id, lat, lon) {
   });
 }
 
+/* ---------- Alias de productos ----------
+   Cuando alguien le enseña a la app cómo se llama un producto en la factura,
+   ese nombre queda guardado y no vuelve a preguntar. */
+async function dbGuardarAlias(alias, productoId, unidadesPorCaja) {
+  return insertar('alias_producto', {
+    alias: alias, producto_id: productoId, origen: 'APRENDIDO',
+    unidades_por_caja: unidadesPorCaja || null,
+    nota: 'Enseñado desde el conversor de pedidos.'
+  });
+}
+
 /* ---------- Hojas de ruta ----------
    El motor calcula con decimales; las columnas de minutos son enteras.
    Redondear acá, en el borde, y no confiar en que la base lo haga. */
@@ -3023,6 +3034,196 @@ function productoPorAlias(nombre) {
 const buscarProductoOriginal = buscarProducto;
 buscarProducto = function (nombre) {
   return productoPorAlias(nombre) || buscarProductoOriginal(nombre);
+};
+
+/* =========================================================
+   Lectura de pedidos, segunda vuelta.
+
+   Lo que reporta Pablo: al copiar y pegar desde el sistema vienen líneas con
+   guiones bajos de relleno ("____ ESCOBILLON GONDOLA") y nombres compuestos
+   ("ESCOBILLON" + el nombre viejo de la marca Sánchez). Eso hacía que no
+   reconociera productos que sí están.
+
+   Se arregla en tres capas, de la más segura a la más floja:
+   1. limpiar el relleno antes de mirar el nombre
+   2. sacar la palabra genérica del principio (ESCOBILLON, CEPILLO…) y probar
+      el resto contra la tabla de alias
+   3. comparar por palabras, separando letras de números (X100 -> X 100)
+   Y si aun así no lo encuentra, ahora se lo podés enseñar: elegís el producto
+   de una lista y queda guardado como alias para siempre.
+   ========================================================= */
+
+/* Palabras que describen el tipo de artículo, no cuál es. Sólo se usan para
+   pelar el nombre y volver a preguntar; nunca para decidir por sí solas. */
+const PALABRAS_TIPO = ['ESCOBILLON', 'ESCOBILLONES', 'CEPILLO', 'ESCOBA', 'ESCOBITA',
+  'ESCOBILLA', 'PLUMERO', 'SECADOR', 'SOPAPA', 'PALA', 'CABO', 'FILTRO', 'NAFTALINA',
+  'VIOLIN', 'PARRILLERO', 'BETUNERO', 'CABALLERIZA', 'DE', 'DEL', 'LA', 'EL'];
+
+function pelarTipo(n) {
+  let p = n.split(' ').filter(Boolean);
+  while (p.length > 1 && PALABRAS_TIPO.includes(p[0])) p = p.slice(1);
+  return p.join(' ');
+}
+
+/* Separa letras de números para que "X100" y "x 100" sean lo mismo. */
+const enPalabras = s => sinAcentos(s)
+  .replace(/([A-Z])(\d)/g, '$1 $2').replace(/(\d)([A-Z])/g, '$1 $2')
+  .replace(/[^A-Z0-9]+/g, ' ').trim().split(' ')
+  // Los números cortos NO se descartan: en esta familia el 60, el 80 y el 100
+  // son justamente lo único que distingue un producto del otro.
+  .filter(t => t.length > 2 || /^\d+$/.test(t));
+
+/* Comparación por palabras, más fina que la original: pide 0,6 de coincidencia
+   Y que el ganador le saque ventaja al segundo, para no elegir a cara o cruz
+   entre dos escobillones que comparten la misma palabra. */
+function buscarProductoFino(nombre) {
+  const tok = enPalabras(nombre);
+  if (!tok.length) return null;
+  let mejor = null, m1 = 0, m2 = 0;
+  for (const p of DATOS.catalogo) {
+    const pt = enPalabras(p.nombre);
+    if (!pt.length) continue;
+    const comunes = tok.filter(t => pt.includes(t)).length;
+    const punt = (2 * comunes) / (tok.length + pt.length);   // Dice
+    if (punt > m1) { m2 = m1; m1 = punt; mejor = p; }
+    else if (punt > m2) { m2 = punt; }
+  }
+  return (m1 >= 0.6 && m1 - m2 >= 0.15) ? mejor : null;
+}
+
+const productoPorAliasBase = productoPorAlias;
+productoPorAlias = function (nombre) {
+  const directo = productoPorAliasBase(nombre);
+  if (directo) return directo;
+  // "ESCOBILLON GONDOLA" -> "GONDOLA", que sí está en la tabla de alias
+  const pelado = pelarTipo(normalizarAlias(nombre));
+  if (pelado && pelado !== normalizarAlias(nombre)) return productoPorAliasBase(pelado);
+  return null;
+};
+
+buscarProducto = function (nombre) {
+  return productoPorAlias(nombre) || buscarProductoFino(nombre) || buscarProductoOriginal(nombre);
+};
+
+/* El relleno del sistema (____, ----, ....) se saca antes de leer el nombre. */
+parsearPedido = function (texto) {
+  return texto.split('\n').map(l => l.trim()).filter(Boolean).map(linea => {
+    const nums = linea.match(/\d+(?:[.,]\d+)?/g) || [];
+    const cantidad = nums.length ? parseInt(String(nums[0]).replace(/[.,].*/, ''), 10) : null;
+    let nombre = linea.replace(/[_\-–—.]{2,}/g, ' ');
+    // El número del final sólo se saca si viene separado como una columna
+    // aparte (dos espacios o más). Si no, es parte del nombre: "CEPILLO
+    // CANCHA DE TENIS X 200" o "BARRENDERO X 80".
+    nombre = nombre.replace(/\s{2,}\d+([.,]\d+)?\s*$/, '');
+    nombre = nombre.replace(/^[\s\d.,]+/, '').replace(/\s+/g, ' ').trim();
+    return { linea, cantidad, nombre };
+  }).filter(x => x.cantidad && x.nombre);
+};
+
+/* =========================================================
+   Conversor de pedidos: si no reconoce un nombre, se le enseña.
+
+   Antes la línea quedaba en "sin catálogo" y no se contaba, sin más. Ahora se
+   elige el producto de una lista y, con eso, la app aprende: el nombre queda
+   guardado como alias y la próxima vez lo reconoce sola.
+   ========================================================= */
+const etiquetaProducto = p =>
+  `${p.nombre} · ${p.codigo ? 'cód. ' + p.codigo : p.linea}${p.unidadesPorCaja ? ' · x' + p.unidadesPorCaja : ''}`;
+
+cargarPedido = function (idCliente) {
+  const cli = DATOS.clientes.find(c => c.id === idCliente);
+  const mapaEtiqueta = new Map(DATOS.catalogo.map(p => [etiquetaProducto(p), p]));
+  const ensenados = new Map();          // nombre tal como vino -> producto elegido a mano
+  let total = 0, lineas = [];
+
+  $('#dlgT').textContent = 'Cargar pedido · ' + cli.nombre;
+  $('#dlgB').innerHTML = `
+    <p class="mini" style="margin-top:0">Pegá las líneas de la hoja de pedido tal como salen del sistema.
+    Las cantidades son <b>unidades</b>; la app las convierte a cajas con el catálogo y <b>redondea siempre para arriba</b>.</p>
+    <textarea id="pedTxt" rows="7" style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;padding:10px;border:1px solid var(--linea);border-radius:8px"
+      placeholder="600 1.00 ______ ESCOBILLON ALAZAN&#10;10 1.00 BARRENDERO X 100 C/CABEZAL PLAS. ______&#10;300 1.00 ______ LAVA COCHE PLASTICO"></textarea>
+    <div class="row" style="margin:10px 0"><button type="button" class="btn azul" id="pedCalc">Convertir a cajas</button></div>
+    <datalist id="listaCatalogo">${DATOS.catalogo.map(p => `<option value="${esc(etiquetaProducto(p))}">`).join('')}</datalist>
+    <div id="pedRes"></div>`;
+
+  const resolver = l => ensenados.get(l.nombre) || buscarProducto(l.nombre);
+
+  const pintar = () => {
+    total = 0;
+    const filas = lineas.map((l, i) => {
+      const p = resolver(l);
+      if (!p || !p.unidadesPorCaja) {
+        return `<tr style="background:rgba(240,138,0,.07)">
+          <td class="num">${l.cantidad}</td>
+          <td>${esc(l.nombre)}
+            <div class="row" style="margin-top:5px;align-items:center;gap:6px">
+              <input list="listaCatalogo" data-fila="${i}" placeholder="¿cuál es? escribí y elegí de la lista…" style="min-width:230px">
+            </div></td>
+          <td class="num">—</td>
+          <td class="num"><span class="badge b-al">no lo reconozco</span></td></tr>`;
+      }
+      const cajas = Math.ceil(l.cantidad / p.unidadesPorCaja);
+      total += cajas;
+      const aprendido = ensenados.has(l.nombre);
+      return `<tr${aprendido ? ' style="background:rgba(46,158,91,.09)"' : ''}>
+        <td class="num">${l.cantidad}</td>
+        <td>${esc(p.nombre)}<div class="mini">${p.codigo ? 'cód. ' + esc(p.codigo) : esc(p.linea)}${aprendido ? ' · lo elegiste vos' : ''}</div></td>
+        <td class="num">${p.unidadesPorCaja}</td><td class="num"><b>${cajas}</b></td></tr>`;
+    });
+    const sinResolver = lineas.filter(l => { const p = resolver(l); return !p || !p.unidadesPorCaja; });
+    const porGuardar = [...ensenados.keys()].length;
+
+    $('#pedRes').innerHTML = `
+      <div class="tabla-wrap"><table style="min-width:0">
+        <thead><tr><th class="num">Unidades</th><th>Producto</th><th class="num">Un./caja</th><th class="num">Cajas</th></tr></thead>
+        <tbody>${filas.join('')}</tbody>
+        <tfoot><tr><td colspan="3" style="text-align:right"><b>Total</b></td><td class="num"><b>${total}</b></td></tr></tfoot>
+      </table></div>
+      ${sinResolver.length ? `<div class="aviso div" style="margin-top:10px"><b>${sinResolver.length} línea${sinResolver.length > 1 ? 's' : ''} sin resolver.</b>
+        Elegí el producto en el recuadro de cada una. Esas líneas todavía no se están contando, así que el total está incompleto.</div>` : ''}
+      ${porGuardar && puedeEditar() ? `<label class="mini" style="display:flex;gap:7px;align-items:center;margin-top:10px">
+        <input type="checkbox" id="pedRecordar" checked>
+        Guardar ${porGuardar === 1 ? 'el nombre que elegiste' : 'los ' + porGuardar + ' nombres que elegiste'}, para que la próxima vez los reconozca solo</label>` : ''}
+      <div class="row" style="margin-top:12px"><button type="button" class="btn pri" id="pedUsar">Usar ${total} cajas para este cliente</button></div>`;
+
+    $$('#pedRes input[data-fila]').forEach(inp => inp.onchange = e => {
+      const p = mapaEtiqueta.get(e.target.value);
+      if (!p) return;
+      ensenados.set(lineas[+e.target.dataset.fila].nombre, p);
+      pintar();
+    });
+
+    $('#pedUsar').onclick = async () => {
+      const btn = $('#pedUsar');
+      const recordar = $('#pedRecordar');
+      if (recordar && recordar.checked && ensenados.size) {
+        btn.disabled = true; btn.textContent = 'Guardando los nombres…';
+        for (const [nombre, p] of ensenados) {
+          const alias = normalizarAlias(nombre);
+          if (!alias || DATOS.alias.some(a => a.alias === alias)) continue;
+          try { await dbGuardarAlias(alias, p.id, null); }
+          catch (e) { /* si falla el guardado no se pierde el pedido: sigue igual */ }
+        }
+        try { DATOS = await cargarTodo(); } catch (e) {}
+        btn.disabled = false;
+      }
+      const e = ESTADO.sel.get(idCliente);
+      if (e) { e.cajas = total; pintarLista(); pintarCarga(); }
+      $('#dlg').close();
+    };
+  };
+
+  $('#pedCalc').onclick = () => {
+    lineas = parsearPedido($('#pedTxt').value);
+    if (!lineas.length) {
+      $('#pedRes').innerHTML = '<div class="aviso div">No pude leer ninguna línea. Cada renglón tiene que tener una cantidad y un producto.</div>';
+      return;
+    }
+    pintar();
+  };
+  $('#dlgOk').style.display = 'none';
+  $('#dlg').addEventListener('close', () => $('#dlgOk').style.display = '', { once: true });
+  $('#dlg').showModal();
 };
 </script>
 </body>
