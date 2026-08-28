@@ -379,13 +379,14 @@ async function cargarPerfil() {
 }
 
 async function cargarTodo() {
-  const [pts, cli, veh, prv, cat, mot] = await Promise.all([
+  const [pts, cli, veh, prv, cat, mot, ali] = await Promise.all([
     leer('puntos_entrega?select=*&activo=is.true&order=id'),
     leer('clientes?select=*&activo=is.true&order=id'),
     leer('vehiculos?select=*&activo=is.true&order=id'),
     leer('proveedores?select=*&activo=is.true&order=id'),
     leer('productos?select=*&activo=is.true&order=id'),
-    leer('motivos_no_entrega?select=motivo&activo=is.true&order=orden')
+    leer('motivos_no_entrega?select=motivo&activo=is.true&order=orden'),
+    leer('alias_producto?select=alias,producto_id,origen')
   ]);
 
   const base = pts.find(p => p.id === 'BARUK');
@@ -424,9 +425,14 @@ async function cargarTodo() {
     })),
 
     catalogo: cat.map(p => ({
-      codigo: p.codigo, nombre: p.nombre, unidadesPorCaja: p.unidades_por_caja,
+      id: p.id, codigo: p.codigo, nombre: p.nombre, unidadesPorCaja: p.unidades_por_caja,
       linea: p.linea, base: p.medida_base, nota: p.nota || ''
     })),
+
+    /* Los mismos productos salen en la factura con otros nombres: la marca
+       Sánchez usa los nombres viejos y la cadena PP les pone su propio prefijo.
+       Esta tabla es la que evita que el conversor de pedidos no los reconozca. */
+    alias: (ali || []).map(a => ({ alias: a.alias, productoId: a.producto_id, origen: a.origen })),
 
     motivosNoEntrega: mot.map(m => m.motivo),
     jornada: JORNADA_FIJA
@@ -2969,6 +2975,44 @@ dibujarMapa = function (r) {
   // Enter dentro de un campo: guarda, no cierra a lo bruto.
   if (form) form.addEventListener('submit', e => { e.preventDefault(); btn.click(); });
 })();
+
+/* =========================================================
+   Alias de productos.
+
+   El mismo producto sale en la factura con nombres distintos:
+   · marca SÁNCHEZ usa los nombres viejos (AZTECA, PLANY, VAPORETO, GÓNDOLA…)
+   · la cadena PP le antepone su prefijo (PP ESCOBILLON AZTECA)
+   · algunos clientes le agregan su nombre atrás (ESCOBILLON AZTECA NUEVA LUZ)
+   Sin esto, el conversor de pedidos no los reconocía y los daba por faltantes.
+   ========================================================= */
+const normalizarAlias = s => sinAcentos(s).replace(/[^A-Z0-9]+/g, ' ').trim();
+
+function productoPorAlias(nombre) {
+  const n = normalizarAlias(nombre);
+  if (!n || !DATOS.alias || !DATOS.alias.length) return null;
+  const dePorId = id => DATOS.catalogo.find(c => c.id === id) || null;
+
+  // 1. El nombre es exactamente un alias conocido.
+  const exacto = DATOS.alias.find(a => a.alias === n);
+  if (exacto) return dePorId(exacto.productoId);
+
+  // 2. El nombre arranca con un alias y sigue con otra cosa: casi siempre es
+  //    el nombre del cliente pegado atrás. Gana el alias más largo, para que
+  //    "PP ESCOBILLON AZTECA" no se lo lleve el alias corto "AZTECA".
+  let mejor = null;
+  for (const a of DATOS.alias) {
+    if (a.alias.length < 5) continue;               // los cortos sólo por exacto
+    if (n === a.alias || n.startsWith(a.alias + ' ')) {
+      if (!mejor || a.alias.length > mejor.alias.length) mejor = a;
+    }
+  }
+  return mejor ? dePorId(mejor.productoId) : null;
+}
+
+const buscarProductoOriginal = buscarProducto;
+buscarProducto = function (nombre) {
+  return productoPorAlias(nombre) || buscarProductoOriginal(nombre);
+};
 </script>
 </body>
 </html>
