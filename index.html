@@ -3420,6 +3420,272 @@ function verRecorrido(i) {
   </table></div></div>`;
   envolverTablas();
 }
+
+
+/* =====================================================================
+   CLIENTES · MAPA POR ZONAS DE CERCANÍA (provincia de Buenos Aires)
+   ---------------------------------------------------------------------
+   Para qué: antes de armar la hoja de ruta, ver de un golpe qué clientes
+   caen juntos. Las zonas NO están escritas en ningún lado: se calculan
+   con las coordenadas cada vez, así que un cliente nuevo entra solo.
+
+   Cómo se arma una zona: se busca el punto que tenga más vecinos dentro
+   del radio elegido y ese pasa a ser el centro; todos los que caen dentro
+   forman la zona y salen del reparto. Se repite hasta que no queda nadie.
+   La garantía es clara: TODO cliente de una zona está a menos del radio
+   del centro de esa zona. Nunca hay cadenas largas.
+
+   Las zonas se numeran por cercanía a BARUK: la 1 es la más cerca.
+   ===================================================================== */
+
+const ZC = { radio: 10, mapa: null, capas: [], grupos: [], abierta: null };
+
+/* Sólo provincia de Buenos Aires. CABA queda afuera a propósito. */
+function esProvinciaBA(p) {
+  const s = sinAcentos(p && p.provincia);
+  if (!s) return false;
+  if (s.includes('CABA') || s.includes('CAPITAL FEDERAL') || s.includes('CIUDAD AUTONOMA')) return false;
+  return s.includes('BUENOS AIRES');
+}
+
+/* Los puntos que son una parada de verdad: tienen coordenada, están en
+   provincia y les cuelga al menos un cliente activo que NO retira. */
+function paradasProvincia() {
+  const porPunto = new Map();
+  DATOS.clientes.forEach(c => {
+    if (c.activo === false) return;
+    if (c.tipoEntrega === 'RETIRA EL CLIENTE') return;   // no genera viaje
+    if (!c.punto) return;
+    if (!porPunto.has(c.punto)) porPunto.set(c.punto, []);
+    porPunto.get(c.punto).push(c);
+  });
+
+  const out = [];
+  porPunto.forEach((cls, pid) => {
+    const p = punto(pid);
+    if (!p || p.lat == null || p.lon == null) return;
+    if (!esProvinciaBA(p)) return;
+    out.push({
+      id: p.id, lat: Number(p.lat), lon: Number(p.lon), p,
+      nombre: p.transporte || p.nombre,
+      esTransporte: cls.some(c => c.tipoEntrega === 'TRANSPORTE'),
+      clientes: cls.slice().sort((a, b) => a.nombre.localeCompare(b.nombre))
+    });
+  });
+  return out;
+}
+
+/* El punto más repetido de una lista: sirve para ponerle nombre a la zona. */
+function masFrecuente(lista) {
+  const cuenta = new Map();
+  lista.filter(Boolean).forEach(x => cuenta.set(x, (cuenta.get(x) || 0) + 1));
+  let mejor = null, n = 0;
+  cuenta.forEach((v, k) => { if (v > n) { n = v; mejor = k; } });
+  return mejor;
+}
+
+function armarZonas(radioKm) {
+  const libres = paradasProvincia();
+  const grupos = [];
+
+  while (libres.length) {
+    let iCentro = 0, mejorN = -1;
+    for (let i = 0; i < libres.length; i++) {
+      let n = 0;
+      for (const o of libres) if (haversine(libres[i], o) <= radioKm) n++;
+      if (n > mejorN) { mejorN = n; iCentro = i; }
+    }
+    const centro = libres[iCentro];
+    const dentro = libres.filter(o => haversine(centro, o) <= radioKm);
+    const ids = new Set(dentro.map(x => x.id));
+    for (let i = libres.length - 1; i >= 0; i--) if (ids.has(libres[i].id)) libres.splice(i, 1);
+
+    const lat = dentro.reduce((s, x) => s + x.lat, 0) / dentro.length;
+    const lon = dentro.reduce((s, x) => s + x.lon, 0) / dentro.length;
+    const localidades = [...new Set(dentro.map(x => (x.p.loc || x.p.partido || '').trim()).filter(Boolean))];
+    grupos.push({
+      lat, lon, centro, paradas: dentro,
+      clientes: dentro.reduce((s, x) => s + x.clientes.length, 0),
+      localidades,
+      nombre: masFrecuente(dentro.map(x => (x.p.partido || x.p.loc || '').trim()).filter(Boolean)) || 'Sin localidad',
+      anchoKm: dentro.length < 2 ? 0 : Math.max(...dentro.map(a =>
+        Math.max(...dentro.map(b => haversine(a, b)))))
+    });
+  }
+
+  /* La zona 1 es la más cercana a la fábrica: así se lee en orden de salida. */
+  const base = DATOS.baruk;
+  grupos.forEach(g => { g.kmBaruk = base ? haversine(base, g) : 0; });
+  grupos.sort((a, b) => a.kmBaruk - b.kmBaruk);
+  grupos.forEach((g, i) => { g.n = i + 1; });
+  return grupos;
+}
+
+/* ---------- La pantalla ---------- */
+function zonasClientes() {
+  ZC.grupos = armarZonas(ZC.radio);
+  const g = ZC.grupos;
+  const totalParadas = g.reduce((s, x) => s + x.paradas.length, 0);
+  const totalClientes = g.reduce((s, x) => s + x.clientes, 0);
+  const solos = g.filter(x => x.paradas.length === 1).length;
+
+  $('#vista').innerHTML = `
+  <div class="top">
+    <div><h1>Clientes por zona · provincia de Buenos Aires</h1>
+      <p>Qué clientes quedan cerca entre sí, para armar la vuelta sin ir y volver.</p></div>
+    <div class="row no-print">
+      <label class="mini" style="align-self:center">Tamaño de zona</label>
+      <select id="zcRadio" style="min-width:150px">
+        ${[5, 10, 15, 20].map(r => `<option value="${r}" ${r === ZC.radio ? 'selected' : ''}>${r} km a la redonda</option>`).join('')}
+      </select>
+      <button class="btn" onclick="clientes(); envolverTablas();">← Volver al listado</button>
+    </div>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><b>${g.length}</b><span>zonas</span></div>
+    <div class="kpi"><b>${totalClientes}</b><span>clientes en provincia</span></div>
+    <div class="kpi"><b>${totalParadas}</b><span>paradas (direcciones)</span></div>
+    <div class="kpi"><b>${solos}</b><span>zonas de un solo punto</span></div>
+  </div>
+
+  <div class="panel" style="padding:0;overflow:hidden">
+    <div id="zcMapa" style="height:460px;width:100%"></div>
+  </div>
+
+  <p class="mini" style="margin:10px 0 6px">Tocá una zona para verla en el mapa y desplegar sus clientes.
+    Las distancias son en línea recta, no de manejo.</p>
+
+  <div id="zcLista">${g.map(z => fichaZona(z)).join('')}</div>
+
+  <div class="aviso reg">Las zonas no están escritas en ningún lado: se calculan con las coordenadas cada vez que abrís
+    esta pantalla. Un cliente nuevo aparece solo, sin que haya que clasificarlo a mano.
+    CABA no entra acá. Los que retiran por fábrica tampoco, porque no generan viaje.</div>`;
+
+  $('#zcRadio').onchange = e => { ZC.radio = Number(e.target.value); ZC.abierta = null; zonasClientes(); envolverTablas(); };
+  dibujarMapaZonas();
+}
+
+function fichaZona(z) {
+  const tr = z.paradas.filter(p => p.esTransporte).length;
+  return `<details class="panel" id="zona${z.n}" style="margin:0 0 8px" ${ZC.abierta === z.n ? 'open' : ''} ontoggle="if(this.open) mirarZona(${z.n})">
+    <summary style="cursor:pointer;list-style:none">
+      <b style="display:inline-block;min-width:2.2em;text-align:center;background:var(--azul,#123a7a);color:#fff;border-radius:999px;padding:2px 8px;margin-right:8px">${z.n}</b>
+      <b>${esc(z.nombre)}</b>
+      <span class="mini"> · ${z.clientes} cliente${z.clientes === 1 ? '' : 's'} en ${z.paradas.length} parada${z.paradas.length === 1 ? '' : 's'}${tr ? ` · ${tr} transporte${tr === 1 ? '' : 's'}` : ''} · a ${km1(z.kmBaruk)} km de BARUK${z.paradas.length > 1 ? ` · ${km1(z.anchoKm)} km de punta a punta` : ''}</span>
+    </summary>
+    <div class="tabla-wrap"><table style="margin-top:8px">
+      <thead><tr><th>Cliente</th><th>Dónde entrega</th><th>Localidad</th><th class="num">km al centro</th></tr></thead>
+      <tbody>${z.paradas.slice().sort((a, b) => haversine(z.centro, a) - haversine(z.centro, b)).map(p =>
+        p.clientes.map((c, i) => `<tr>
+          <td><b>${esc(c.nombre)}</b> ${c.tipoEntrega === 'TRANSPORTE' ? '<span class="badge b-tr">Transporte</span>' : ''} ${badgeModo(c.modo)}</td>
+          <td class="mini">${i === 0 ? (p.p.transporte ? '<b>' + esc(p.p.transporte) + '</b> · ' : '') + esc(p.p.dir) : '<span style="opacity:.5">(misma dirección)</span>'}</td>
+          <td class="mini">${i === 0 ? esc(p.p.loc || p.p.partido || '') : ''}</td>
+          <td class="num">${i === 0 ? km1(haversine(z.centro, p)) : ''}</td></tr>`).join('')
+      ).join('')}</tbody>
+    </table></div>
+  </details>`;
+}
+
+function mirarZona(n) {
+  ZC.abierta = n;
+  const z = ZC.grupos.find(x => x.n === n);
+  if (!z || !ZC.mapa) return;
+  if (z.paradas.length === 1) ZC.mapa.setView([z.lat, z.lon], 13);
+  else ZC.mapa.fitBounds(z.paradas.map(p => [p.lat, p.lon]), { padding: [40, 40], maxZoom: 14 });
+}
+
+function dibujarMapaZonas() {
+  const cont = $('#zcMapa');
+  if (!cont) return;
+  /* El mapa viene de internet. Si no cargó, la pantalla igual sirve: lo que
+     manda es la lista de abajo. Mejor decirlo que dejar un cuadro gris. */
+  if (typeof L === 'undefined') {
+    ZC.mapa = null;
+    cont.style.height = 'auto';
+    cont.innerHTML = `<div class="aviso" id="zcSinMapa" style="margin:0">No se pudo cargar el mapa
+      (hace falta internet para bajarlo). Las zonas de abajo están calculadas igual y sirven lo mismo.</div>`;
+    return;
+  }
+  if (ZC.mapa) { try { ZC.mapa.remove(); } catch (e) {} ZC.mapa = null; }
+
+  const map = L.map('zcMapa', { scrollWheelZoom: false }).setView([-34.8, -58.3], 9);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    { maxZoom: 18, attribution: '© OpenStreetMap' }).addTo(map);
+  ZC.mapa = map;
+
+  const puntos = [];
+
+  if (DATOS.baruk && DATOS.baruk.lat != null) {
+    L.marker([DATOS.baruk.lat, DATOS.baruk.lon]).addTo(map).bindPopup('<b>BARUK SRL</b><br>Punto de salida');
+    puntos.push([DATOS.baruk.lat, DATOS.baruk.lon]);
+  }
+
+  ZC.grupos.forEach(z => {
+    /* Cada parada, un puntito. El número va en el centro de la zona. */
+    z.paradas.forEach(p => {
+      L.circleMarker([p.lat, p.lon], {
+        radius: 5, weight: 1, color: '#123a7a', fillColor: p.esTransporte ? '#f0a020' : '#2f6fd0', fillOpacity: .9
+      }).addTo(map).bindPopup(
+        `<b>Zona ${z.n} · ${esc(z.nombre)}</b><br>${esc(p.p.dir)}<br><span style="opacity:.7">${esc(p.p.loc || p.p.partido || '')}</span><br>` +
+        p.clientes.map(c => '• ' + esc(c.nombre)).join('<br>'));
+      puntos.push([p.lat, p.lon]);
+    });
+
+    L.marker([z.lat, z.lon], {
+      icon: L.divIcon({
+        className: 'zc-num',
+        html: `<div style="background:#123a7a;color:#fff;border:2px solid #fff;border-radius:999px;width:30px;height:30px;
+               display:flex;align-items:center;justify-content:center;font:700 14px/1 system-ui;box-shadow:0 1px 4px rgba(0,0,0,.4)">${z.n}</div>`,
+        iconSize: [30, 30], iconAnchor: [15, 15]
+      })
+    }).addTo(map)
+      .bindPopup(`<b>Zona ${z.n} · ${esc(z.nombre)}</b><br>${z.clientes} clientes en ${z.paradas.length} paradas<br>a ${km1(z.kmBaruk)} km de BARUK`)
+      .on('click', () => {
+        const d = document.getElementById('zona' + z.n);
+        if (d) { d.open = true; d.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+      });
+  });
+
+  if (puntos.length) map.fitBounds(puntos, { padding: [30, 30] });
+  setTimeout(() => { try { map.invalidateSize(); } catch (e) {} }, 60);
+}
+
+/* ---------- Listado de clientes: se le agrega el botón del mapa ----------
+   Es el mismo listado de siempre; lo único nuevo es el botón. */
+function clientes() {
+  const cs = DATOS.clientes.slice().sort((a, b) => a.nombre.localeCompare(b.nombre));
+  $('#vista').innerHTML = `
+  <div class="top"><div><h1>Clientes</h1><p>${DATOS.clientes.length} clientes · ${DATOS.puntos.length} puntos de entrega</p></div>
+    <div class="row no-print"><input type="text" id="qc" style="min-width:290px"
+      placeholder="Buscar por cliente, dirección, localidad o transporte…"><button class="btn" onclick="zonasClientes(); envolverTablas();">Ver por zonas (prov. Bs As)</button><button class="btn pri" onclick="editarCliente()">+ Agregar cliente</button></div></div>
+  <p class="mini no-print" id="qcCuenta" style="margin:-6px 0 10px"></p>
+  <div class="panel" style="padding:0"><div class="tabla-wrap"><table>
+    <thead><tr><th>Código</th><th>Razón social</th><th>Punto de entrega</th><th>Tipo</th><th>Modo de carga</th><th>Reglas</th><th class="no-print"></th></tr></thead>
+    <tbody id="tbc"></tbody></table></div></div>`;
+  const pintar = (q = '') => {
+    const partes = sinTildes(q).split(/\s+/).filter(Boolean);
+    const hallados = cs.filter(c => {
+      if (!partes.length) return true;
+      const t = textoBuscable(c);
+      return partes.every(p => t.includes(p));      // todas las palabras, en cualquier orden
+    });
+    const cuenta = $('#qcCuenta');
+    if (cuenta) cuenta.textContent = !partes.length ? ''
+      : hallados.length === 1 ? '1 cliente encontrado'
+      : `${hallados.length} clientes encontrados`;
+    $('#tbc').innerHTML = hallados.map(c => {
+      const p = c.punto ? punto(c.punto) : null;
+      return `<tr><td>${esc(c.id)}</td><td><b>${esc(c.nombre)}</b></td>
+        <td>${p ? (p.transporte ? '<b>' + esc(p.transporte) + '</b><br>' : '') + esc(p.dir) + '<br><span class="mini">' + esc(p.loc || p.partido) + '</span>' : '<span class="mini">Retira el cliente</span>'}</td>
+        <td>${c.tipoEntrega === 'TRANSPORTE' ? '<span class="badge b-tr">Transporte</span>' : c.tipoEntrega === 'RETIRA EL CLIENTE' ? '<span class="badge b-sd">Retira</span>' : '<span class="badge b-cl">Cliente</span>'}</td>
+        <td>${badgeModo(c.modo)}</td>
+        <td class="mini">${c.orden !== 'SIN RESTRICCION' ? '<span class="badge b-al">' + c.orden + '</span> ' : ''}${c.turno ? 'Requiere turno. ' : ''}${esc(c.regla || '')}</td>
+        <td class="no-print"><button class="btn sm" onclick="editarCliente('${c.id}')">Editar</button></td></tr>`;
+    }).join('');
+  };
+  pintar(); $('#qc').oninput = e => pintar(e.target.value);
+}
 </script>
 </body>
 </html>
