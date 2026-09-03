@@ -3279,6 +3279,17 @@ async function cargarEquipo() {
 
 const nombreDeUsuario = id => (id && EQUIPO.get(id)) || '—';
 
+/* Cuándo se armó la hoja: día y hora, en la hora de acá.
+   Ojo: NO es lo mismo que la columna "Fecha", que es el día del reparto.
+   La base lo guarda en UTC; el navegador lo pasa a la hora local solo. */
+function fechaHora(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return d.toLocaleDateString('es-AR') + ' ' +
+         d.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
 /* ---------- Historial: se agrega creado_por al mapeo ----------
    La consulta ya traía la columna (pide select=*); lo único que faltaba
    era pasarla al objeto que usa la pantalla. */
@@ -3354,7 +3365,7 @@ function historial() {
   <div class="panel" style="padding:0"><div class="tabla-wrap"><table id="tablaHistorial">
     <thead><tr><th>Fecha</th><th>Zona</th><th>Vehículo</th><th>Armada por</th><th>Chofer</th><th class="num">Rutas</th><th class="num">Paradas</th><th class="num">Pedidos</th><th class="num">Km</th><th class="num">Jornada</th><th class="num">Sin entregar</th><th>Estado</th><th class="no-print"></th></tr></thead>
     <tbody>${h.map((x, i) => `<tr><td>${new Date(x.fecha + 'T12:00').toLocaleDateString('es-AR')}</td><td>${esc(x.zona)}</td><td>${esc(x.vehiculo)}</td>
-      <td class="mini">${esc(nombreDeUsuario(x.creadoPor))}</td><td>${esc(x.chofer)}</td>
+      <td class="mini">${esc(nombreDeUsuario(x.creadoPor))}${x.creadoEn ? `<br><span style="opacity:.65">${esc(fechaHora(x.creadoEn))}</span>` : ''}</td><td>${esc(x.chofer)}</td>
       <td class="num">${x.rutas}</td><td class="num">${x.paradas}</td><td class="num">${x.pedidos}</td><td class="num">${num(x.km)}</td><td class="num">${fmtHoras(x.min)}</td>
       <td class="num">${x.estado === 'Realizada' && x.detalle ? (x.noEntregados ? `<b style="color:var(--rojo)">${x.noEntregados}</b>` : '0') : '—'}</td>
       <td><span class="badge ${x.estado === 'Realizada' ? 'b-cl' : 'b-gra'}">${esc(x.estado)}</span></td>
@@ -3391,7 +3402,8 @@ function verRecorrido(i) {
   <div class="top">
     <div><h1>Recorrido del ${new Date(h.fecha + 'T12:00').toLocaleDateString('es-AR')}</h1>
       <p>${esc(h.vehiculo)} · ${esc(h.zona || '(sin zona)')} · ${paradas.length} paradas · ${h.pedidos} pedidos ·
-         ${num(h.km)} km · ${fmtHoras(h.min)} · armada por <b>${esc(nombreDeUsuario(h.creadoPor))}</b></p></div>
+         ${num(h.km)} km · ${fmtHoras(h.min)}<br>
+         Armada por <b>${esc(nombreDeUsuario(h.creadoPor))}</b>${h.creadoEn ? ' el ' + esc(fechaHora(h.creadoEn)) : ''}</p></div>
     <div class="row no-print">
       <button class="btn" onclick="volverHistorial()">← Volver al historial</button>
       ${h.detalle && h.detalle.length ? `<button class="btn azul" onclick="cerrarRuta(${i})">${h.estado === 'Realizada' ? 'Ver el cierre' : 'Cerrar la ruta'}</button>` : ''}
