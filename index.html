@@ -3227,6 +3227,187 @@ cargarPedido = function (idCliente) {
   $('#dlg').addEventListener('close', () => $('#dlgOk').style.display = '', { once: true });
   $('#dlg').showModal();
 };
+
+
+/* =====================================================================
+   HISTORIAL · quién armó cada hoja y ver el recorrido sin cerrarlo
+   ---------------------------------------------------------------------
+   Todo lo de acá abajo REEMPLAZA definiciones anteriores (este bloque va
+   último en el archivo). Nada de lo anterior se borra: se pisa.
+   ===================================================================== */
+
+/* ---------- Quién soy, sacado del propio token ----------
+   El token de Supabase es un JWT: la parte del medio trae el uuid del
+   usuario en "sub". Se lee acá, sin preguntarle nada al servidor. */
+function uidSesion() {
+  try {
+    const partes = String(SESION.token || '').split('.');
+    if (partes.length !== 3) return null;               // en las pruebas el token es de mentira
+    const cuerpo = partes[1].replace(/-/g, '+').replace(/_/g, '/');
+    const json = decodeURIComponent(atob(cuerpo + '==='.slice((cuerpo.length + 3) % 4))
+      .split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+    return JSON.parse(json).sub || null;
+  } catch (e) { return null; }
+}
+
+/* ---------- Mi perfil ----------
+   Antes pedía todos los perfiles y se quedaba con el primero. Mientras
+   sólo el admin veía más de uno y encima era el primero de la lista, no
+   se notaba; con más gente en el equipo podía agarrar el perfil de otro
+   y darle un rol que no es el suyo. Ahora pide el propio por id. */
+async function cargarPerfil() {
+  const uid = uidSesion();
+  const f = await leer('perfiles?select=id,nombre,rol,activo' + (uid ? '&id=eq.' + encodeURIComponent(uid) : ''));
+  SESION.perfil = (uid ? (f || []).find(x => x.id === uid) : (f && f[0])) || (f && f[0]) || null;
+  return SESION.perfil;
+}
+
+/* ---------- Los nombres del equipo ----------
+   Sólo id y nombre, para poder escribir "armada por" en el historial.
+   Si la base no lo deja (usuario sin permiso), queda vacío y la columna
+   muestra un guión: nunca rompe la pantalla. */
+const EQUIPO = new Map();
+let equipoPedido = false;
+
+async function cargarEquipo() {
+  try {
+    const f = await leer('perfiles?select=id,nombre');
+    (f || []).forEach(p => { if (p && p.id) EQUIPO.set(p.id, p.nombre || '—'); });
+  } catch (e) { /* sin nombres, el historial igual funciona */ }
+  return EQUIPO;
+}
+
+const nombreDeUsuario = id => (id && EQUIPO.get(id)) || '—';
+
+/* ---------- Historial: se agrega creado_por al mapeo ----------
+   La consulta ya traía la columna (pide select=*); lo único que faltaba
+   era pasarla al objeto que usa la pantalla. */
+async function dbCargarHistorial() {
+  const hojas = await leer(
+    'hojas_ruta?select=*,paradas(ruta_nro,orden,punto_id,proveedor_id,tipo_visita,' +
+    'puntos_entrega(nombre,transporte,zona),proveedores(nombre),' +
+    'pedidos(id,entregado,motivo_no_entrega,observacion,clientes(razon_social)))' +
+    '&order=fecha.desc&limit=200');
+
+  return hojas.map(h => {
+    const detalle = [];
+    const recorrido = [];
+    (h.paradas || [])
+      .slice().sort((a, b) => a.ruta_nro - b.ruta_nro || a.orden - b.orden)
+      .forEach(pa => {
+        /* El recorrido se arma con TODAS las paradas, tengan pedido o no:
+           un retiro en un proveedor es una parada real aunque no lleve carga. */
+        recorrido.push({
+          ruta: pa.ruta_nro, orden: pa.orden,
+          punto: pa.puntos_entrega ? (pa.puntos_entrega.transporte || pa.puntos_entrega.nombre)
+               : pa.proveedores ? etiquetaVisita(pa.tipo_visita) + ' · ' + pa.proveedores.nombre
+               : (pa.punto_id || pa.proveedor_id || '—'),
+          zona: pa.puntos_entrega ? (pa.puntos_entrega.zona || '') : '',
+          esProveedor: !!pa.proveedor_id,
+          clientes: (pa.pedidos || []).map(pd => (pd.clientes && pd.clientes.razon_social) || '(cliente borrado)')
+        });
+        return (pa.pedidos || []).forEach(pd => detalle.push({
+        pedidoId: pd.id,
+        ruta: pa.ruta_nro, orden: pa.orden,
+        cliente: (pd.clientes && pd.clientes.razon_social) || '(cliente borrado)',
+        punto: pa.puntos_entrega ? (pa.puntos_entrega.transporte || pa.puntos_entrega.nombre)
+             : pa.proveedores ? etiquetaVisita(pa.tipo_visita) + ' · ' + pa.proveedores.nombre
+             : (pa.punto_id || pa.proveedor_id || '—'),
+        zona: pa.puntos_entrega ? pa.puntos_entrega.zona : '',
+        entregado: pd.entregado, motivo: pd.motivo_no_entrega || '', obs: pd.observacion || ''
+      }));
+      });
+
+    const rutasNro = new Set((h.paradas || []).map(p => p.ruta_nro));
+    const entregados = detalle.filter(d => d.entregado === true).length;
+    return {
+      id: h.id, fecha: h.fecha, vehiculo: h.vehiculo_id, chofer: h.chofer || '—',
+      rutas: rutasNro.size || 1, paradas: (h.paradas || []).length, pedidos: detalle.length,
+      km: Number(h.km_total || 0), min: h.minutos_total || 0,
+      zona: h.zona_principal || '', estado: h.estado, detalle, recorrido,
+      entregados, noEntregados: detalle.length - entregados,
+      creadoPor: h.creado_por || null, creadoEn: h.creado_en || null
+    };
+  });
+}
+
+/* ---------- La pantalla del historial ---------- */
+function historial() {
+  /* Los nombres se piden una sola vez, y recién cuando hacen falta.
+     Si llegan después, se vuelve a dibujar sólo si seguís en esta pantalla. */
+  if (!EQUIPO.size && !equipoPedido) {
+    equipoPedido = true;
+    cargarEquipo().then(() => { if ($('#tablaHistorial')) { historial(); envolverTablas(); } });
+  }
+
+  const h = ESTADO.historial;
+  const totKm = h.reduce((s, x) => s + x.km, 0), totPed = h.reduce((s, x) => s + x.pedidos, 0);
+  $('#vista').innerHTML = `
+  <div class="top"><div><h1>Historial de hojas de ruta</h1><p>Todo lo planificado queda registrado para poder comparar después.</p></div>
+    </div>
+  <div class="kpis">
+    <div class="kpi"><b>${h.length}</b><span>hojas registradas</span></div>
+    <div class="kpi"><b>${num(totKm)} km</b><span>kilómetros acumulados</span></div>
+    <div class="kpi"><b>${totPed}</b><span>pedidos entregados</span></div>
+    <div class="kpi"><b>${num(totKm / Math.max(totPed, 1))} km</b><span>por pedido</span></div>
+  </div>
+  <div class="panel" style="padding:0"><div class="tabla-wrap"><table id="tablaHistorial">
+    <thead><tr><th>Fecha</th><th>Zona</th><th>Vehículo</th><th>Armada por</th><th>Chofer</th><th class="num">Rutas</th><th class="num">Paradas</th><th class="num">Pedidos</th><th class="num">Km</th><th class="num">Jornada</th><th class="num">Sin entregar</th><th>Estado</th><th class="no-print"></th></tr></thead>
+    <tbody>${h.map((x, i) => `<tr><td>${new Date(x.fecha + 'T12:00').toLocaleDateString('es-AR')}</td><td>${esc(x.zona)}</td><td>${esc(x.vehiculo)}</td>
+      <td class="mini">${esc(nombreDeUsuario(x.creadoPor))}</td><td>${esc(x.chofer)}</td>
+      <td class="num">${x.rutas}</td><td class="num">${x.paradas}</td><td class="num">${x.pedidos}</td><td class="num">${num(x.km)}</td><td class="num">${fmtHoras(x.min)}</td>
+      <td class="num">${x.estado === 'Realizada' && x.detalle ? (x.noEntregados ? `<b style="color:var(--rojo)">${x.noEntregados}</b>` : '0') : '—'}</td>
+      <td><span class="badge ${x.estado === 'Realizada' ? 'b-cl' : 'b-gra'}">${esc(x.estado)}</span></td>
+      <td class="no-print">${x.detalle && x.detalle.length ? `<button class="btn sm" onclick="verRecorrido(${i})">Ver recorrido</button> ` : ''}${
+        x.detalle ? `<button class="btn sm" onclick="cerrarRuta(${i})">${x.estado === 'Realizada' ? 'Ver cierre' : 'Cerrar ruta'}</button>` : ''}${
+        esAdmin() ? ` <button class="btn sm peligro" onclick="borrarHoja(${i})">Borrar</button>` : ''}</td></tr>`).join('')}</tbody>
+  </table></div></div>
+  <div class="aviso reg">Las hojas son de todos: acá aparecen las que armaste vos y las que armó cualquiera del equipo; la columna <b>Armada por</b> dice quién fue.
+    Con unos meses de historial, esta pantalla va a poder mostrarte kilómetros por cliente, costo por entrega y comparación entre lo planificado y lo realmente recorrido.</div>
+  ${esAdmin() && h.length ? `<div class="panel"><h3>Vaciar el historial</h3>
+    <p class="mini" style="margin:6px 0 10px">Borra las ${h.length} hojas y todo lo que colgaba de ellas: paradas, pedidos y motivos de no entrega.
+    No se puede deshacer. Sirve para limpiar las pruebas antes de empezar a usar la app en serio.</p>
+    <button class="btn peligro no-print" onclick="vaciarHistorial()">Borrar las ${h.length} hojas</button></div>` : ''}`;
+}
+
+/* ---------- Ver el recorrido, sin tocar nada ----------
+   Es de sólo lectura. Para marcar entregas está "Cerrar ruta". */
+function verRecorrido(i) {
+  const h = ESTADO.historial[i];
+  if (!h) return;
+  /* Hojas viejas, cargadas antes de este cambio, pueden no tener "recorrido"
+     en memoria: en ese caso se arma con lo que hay en el detalle. */
+  const paradas = (h.recorrido && h.recorrido.length) ? h.recorrido : (() => {
+    const m = new Map();
+    (h.detalle || []).forEach(d => {
+      const k = d.ruta + '·' + d.orden;
+      if (!m.has(k)) m.set(k, { ruta: d.ruta, orden: d.orden, punto: d.punto, zona: d.zona, clientes: [] });
+      m.get(k).clientes.push(d.cliente);
+    });
+    return [...m.values()].sort((a, b) => a.ruta - b.ruta || a.orden - b.orden);
+  })();
+
+  $('#vista').innerHTML = `
+  <div class="top">
+    <div><h1>Recorrido del ${new Date(h.fecha + 'T12:00').toLocaleDateString('es-AR')}</h1>
+      <p>${esc(h.vehiculo)} · ${esc(h.zona || '(sin zona)')} · ${paradas.length} paradas · ${h.pedidos} pedidos ·
+         ${num(h.km)} km · ${fmtHoras(h.min)} · armada por <b>${esc(nombreDeUsuario(h.creadoPor))}</b></p></div>
+    <div class="row no-print">
+      <button class="btn" onclick="volverHistorial()">← Volver al historial</button>
+      ${h.detalle && h.detalle.length ? `<button class="btn azul" onclick="cerrarRuta(${i})">${h.estado === 'Realizada' ? 'Ver el cierre' : 'Cerrar la ruta'}</button>` : ''}
+    </div>
+  </div>
+  <div class="aviso reg">Esta pantalla es sólo para mirar. No cambia nada de la hoja.</div>
+  <div class="panel" style="padding:0"><div class="tabla-wrap"><table id="tablaRecorrido">
+    <thead><tr><th style="width:52px">Ruta</th><th style="width:52px">Orden</th><th>Punto de entrega</th><th>Zona</th><th>Clientes</th></tr></thead>
+    <tbody>${paradas.map(p => `<tr>
+      <td>${p.ruta}</td><td>${p.orden}</td><td><b>${esc(p.punto)}</b></td>
+      <td class="mini">${esc(p.zona || '—')}</td>
+      <td class="mini">${p.clientes && p.clientes.length ? p.clientes.map(c => esc(c)).join(' · ') : '—'}</td>
+    </tr>`).join('')}</tbody>
+  </table></div></div>`;
+  envolverTablas();
+}
 </script>
 </body>
 </html>
