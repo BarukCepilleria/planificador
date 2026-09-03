@@ -3438,19 +3438,33 @@ function verRecorrido(i) {
    Las zonas se numeran por cercanía a BARUK: la 1 es la más cerca.
    ===================================================================== */
 
-const ZC = { radio: 10, mapa: null, capas: [], grupos: [], abierta: null };
+const ZC = { radio: 10, ambito: 'PROV', mapa: null, capas: [], grupos: [], abierta: null };
+const AMBITOS = { PROV: 'Provincia de Bs As', CABA: 'CABA', TODO: 'Las dos' };
 
-/* Sólo provincia de Buenos Aires. CABA queda afuera a propósito. */
+/* La provincia viene escrita de varias formas: "CABA", "Capital Federal" y
+   "Ciudad Autónoma de Buenos Aires" son todas lo mismo, y esta última encima
+   contiene "Buenos Aires", así que hay que descartarla ANTES de preguntar. */
+function esCABA(p) {
+  const s = sinAcentos(p && p.provincia);
+  return !!s && (s.includes('CABA') || s.includes('CAPITAL FEDERAL') || s.includes('CIUDAD AUTONOMA'));
+}
+
 function esProvinciaBA(p) {
   const s = sinAcentos(p && p.provincia);
-  if (!s) return false;
-  if (s.includes('CABA') || s.includes('CAPITAL FEDERAL') || s.includes('CIUDAD AUTONOMA')) return false;
+  if (!s || esCABA(p)) return false;
   return s.includes('BUENOS AIRES');
 }
 
-/* Los puntos que son una parada de verdad: tienen coordenada, están en
-   provincia y les cuelga al menos un cliente activo que NO retira. */
-function paradasProvincia() {
+function entraEnAmbito(p, ambito) {
+  if (ambito === 'CABA') return esCABA(p);
+  if (ambito === 'TODO') return esCABA(p) || esProvinciaBA(p);
+  return esProvinciaBA(p);
+}
+
+/* Los puntos que son una parada de verdad: tienen coordenada, caen en el
+   ámbito elegido y les cuelga al menos un cliente activo que NO retira. */
+function paradasDelAmbito(ambito) {
+  ambito = ambito || ZC.ambito;
   const porPunto = new Map();
   DATOS.clientes.forEach(c => {
     if (c.activo === false) return;
@@ -3464,11 +3478,12 @@ function paradasProvincia() {
   porPunto.forEach((cls, pid) => {
     const p = punto(pid);
     if (!p || p.lat == null || p.lon == null) return;
-    if (!esProvinciaBA(p)) return;
+    if (!entraEnAmbito(p, ambito)) return;
     out.push({
       id: p.id, lat: Number(p.lat), lon: Number(p.lon), p,
       nombre: p.transporte || p.nombre,
       esTransporte: cls.some(c => c.tipoEntrega === 'TRANSPORTE'),
+      esCaba: esCABA(p),
       clientes: cls.slice().sort((a, b) => a.nombre.localeCompare(b.nombre))
     });
   });
@@ -3484,8 +3499,8 @@ function masFrecuente(lista) {
   return mejor;
 }
 
-function armarZonas(radioKm) {
-  const libres = paradasProvincia();
+function armarZonas(radioKm, ambito) {
+  const libres = paradasDelAmbito(ambito);
   const grupos = [];
 
   while (libres.length) {
@@ -3521,9 +3536,37 @@ function armarZonas(radioKm) {
   return grupos;
 }
 
+/* El nombre viejo se deja como atajo del ámbito por defecto. */
+function paradasProvincia() { return paradasDelAmbito('PROV'); }
+
+/* Decir en la cara cuántos clientes NO se están viendo y por qué. Una
+   pantalla que filtra sin avisar hace tomar decisiones sobre media cartera. */
+function afuera() {
+  const act = DATOS.clientes.filter(c => c.activo !== false);
+  const retiran = act.filter(c => c.tipoEntrega === 'RETIRA EL CLIENTE' || !c.punto).length;
+  const sinCoord = act.filter(c => {
+    if (c.tipoEntrega === 'RETIRA EL CLIENTE' || !c.punto) return false;
+    const p = punto(c.punto);
+    return !p || p.lat == null || p.lon == null;
+  }).length;
+  const fuera = act.filter(c => {
+    if (c.tipoEntrega === 'RETIRA EL CLIENTE' || !c.punto) return false;
+    const p = punto(c.punto);
+    if (!p || p.lat == null) return false;
+    return !entraEnAmbito(p, ZC.ambito);
+  }).length;
+
+  const partes = [];
+  if (fuera) partes.push(`<b>${fuera}</b> que no ${fuera === 1 ? 'está' : 'están'} en ${esc(AMBITOS[ZC.ambito])}`);
+  if (retiran) partes.push(`<b>${retiran}</b> que retira${retiran === 1 ? '' : 'n'} por fábrica (no generan viaje)`);
+  if (sinCoord) partes.push(`<b>${sinCoord}</b> sin coordenada cargada`);
+  if (!partes.length) return 'Acá está toda la cartera activa.';
+  return 'De los ' + act.length + ' clientes activos, no aparecen en este mapa: ' + partes.join('; ') + '.';
+}
+
 /* ---------- La pantalla ---------- */
 function zonasClientes() {
-  ZC.grupos = armarZonas(ZC.radio);
+  ZC.grupos = armarZonas(ZC.radio, ZC.ambito);
   const g = ZC.grupos;
   const totalParadas = g.reduce((s, x) => s + x.paradas.length, 0);
   const totalClientes = g.reduce((s, x) => s + x.clientes, 0);
@@ -3531,9 +3574,13 @@ function zonasClientes() {
 
   $('#vista').innerHTML = `
   <div class="top">
-    <div><h1>Clientes por zona · provincia de Buenos Aires</h1>
+    <div><h1>Clientes por zona · ${esc(AMBITOS[ZC.ambito])}</h1>
       <p>Qué clientes quedan cerca entre sí, para armar la vuelta sin ir y volver.</p></div>
     <div class="row no-print">
+      <label class="mini" style="align-self:center">Dónde</label>
+      <select id="zcAmbito" style="min-width:160px">
+        ${Object.keys(AMBITOS).map(k => `<option value="${k}" ${k === ZC.ambito ? 'selected' : ''}>${esc(AMBITOS[k])}</option>`).join('')}
+      </select>
       <label class="mini" style="align-self:center">Tamaño de zona</label>
       <select id="zcRadio" style="min-width:150px">
         ${[5, 10, 15, 20].map(r => `<option value="${r}" ${r === ZC.radio ? 'selected' : ''}>${r} km a la redonda</option>`).join('')}
@@ -3544,7 +3591,7 @@ function zonasClientes() {
 
   <div class="kpis">
     <div class="kpi"><b>${g.length}</b><span>zonas</span></div>
-    <div class="kpi"><b>${totalClientes}</b><span>clientes en provincia</span></div>
+    <div class="kpi"><b>${totalClientes}</b><span>clientes acá</span></div>
     <div class="kpi"><b>${totalParadas}</b><span>paradas (direcciones)</span></div>
     <div class="kpi"><b>${solos}</b><span>zonas de un solo punto</span></div>
   </div>
@@ -3560,8 +3607,9 @@ function zonasClientes() {
 
   <div class="aviso reg">Las zonas no están escritas en ningún lado: se calculan con las coordenadas cada vez que abrís
     esta pantalla. Un cliente nuevo aparece solo, sin que haya que clasificarlo a mano.
-    CABA no entra acá. Los que retiran por fábrica tampoco, porque no generan viaje.</div>`;
+    ${afuera()}</div>`;
 
+  $('#zcAmbito').onchange = e => { ZC.ambito = e.target.value; ZC.abierta = null; zonasClientes(); envolverTablas(); };
   $('#zcRadio').onchange = e => { ZC.radio = Number(e.target.value); ZC.abierta = null; zonasClientes(); envolverTablas(); };
   dibujarMapaZonas();
 }
@@ -3625,7 +3673,8 @@ function dibujarMapaZonas() {
     /* Cada parada, un puntito. El número va en el centro de la zona. */
     z.paradas.forEach(p => {
       L.circleMarker([p.lat, p.lon], {
-        radius: 5, weight: 1, color: '#123a7a', fillColor: p.esTransporte ? '#f0a020' : '#2f6fd0', fillOpacity: .9
+        radius: 5, weight: 1, color: p.esCaba ? '#7a3d9c' : '#123a7a',
+        fillColor: p.esTransporte ? '#f0a020' : (p.esCaba ? '#9b59d0' : '#2f6fd0'), fillOpacity: .9
       }).addTo(map).bindPopup(
         `<b>Zona ${z.n} · ${esc(z.nombre)}</b><br>${esc(p.p.dir)}<br><span style="opacity:.7">${esc(p.p.loc || p.p.partido || '')}</span><br>` +
         p.clientes.map(c => '• ' + esc(c.nombre)).join('<br>'));
