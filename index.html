@@ -359,7 +359,11 @@ const rpc      = (fn, args)       => api('rpc/' + fn, { metodo: 'POST', cuerpo: 
    ========================================================= */
 const JORNADA_FIJA = {
   inicio: '07:00', fin: '17:00', salidaTipica: '09:00',
-  descargaCliente: 15, descargaTransporte: 30, cajasPorPallet: 45
+  descargaCliente: 15, descargaTransporte: 30, cajasPorPallet: 45,
+  /* Supuesto general: la mayoría recibe hasta las 16. NO es una regla: el
+     punto que tenga horario propio cargado se maneja con el suyo. Poner null
+     acá apaga el supuesto. */
+  limiteRecepcion: '16:00'
 };
 
 function filaAPunto(p) {
@@ -760,6 +764,21 @@ function ventanaProveedor(horario) {
   if (!m) return null;
   return [[`${m[1]}:${m[2] || '00'}`, `${m[3]}:${m[4] || '00'}`]];
 }
+/* ---------- Límite general de recepción ----------
+   Pablo: "GENERALMENTE, no es una regla si o si, pero muchos clientes reciben
+   hasta las 16". Es un SUPUESTO, no un dato, y se trata distinto de un horario
+   declarado: éste manda, aquél sólo empuja. Aplica al punto que NO tiene
+   horario propio; si lo tiene, gana el suyo. */
+const LIMITE_BLANDO_POR_DEFECTO = 16 * 60;      // 16:00
+
+function limiteBlando(datos) {
+  const v = datos && datos.jornada && datos.jornada.limiteRecepcion;
+  if (v === null || v === false) return null;   // apagado a propósito
+  if (typeof v === 'string' && /^\d{1,2}:\d{2}$/.test(v)) return aMinutos(v);
+  if (typeof v === 'number') return v;
+  return LIMITE_BLANDO_POR_DEFECTO;
+}
+
 /* Momento en que se cierra la última ventana: sirve para priorizar. */
 function cierreVentana(ventanas) {
   if (!ventanas || !ventanas.length) return Infinity;
@@ -798,12 +817,15 @@ function vecinoMasCercano(ids, M) {
   return orden;
 }
 
-/* ---------- Mejora: 2-opt + Or-opt ---------- */
-function mejorar(orden, M, nodoFijo) {
+/* ---------- Mejora: 2-opt + Or-opt ----------
+   "cerrada" dice si el camión vuelve a BARUK al final. Importa mucho: en una
+   vuelta abierta conviene TERMINAR lejos, y en una cerrada conviene volver
+   cerca. Optimizar una como si fuera la otra da otro orden. */
+function mejorar(orden, M, nodoFijo, cerrada = true) {
   const fijar = nodoFijo != null && orden.includes(nodoFijo);
   let ruta = fijar ? orden.filter(i => i !== nodoFijo) : orden.slice();
   if (ruta.length < 3) return fijar ? ruta.concat([nodoFijo]) : ruta;
-  const costo = r => costoRuta(fijar ? r.concat([nodoFijo]) : r, M).km;
+  const costo = r => costoRuta(fijar ? r.concat([nodoFijo]) : r, M, cerrada).km;
 
   let mejora = true, vueltas = 0;
   while (mejora && vueltas < 60) {
@@ -832,9 +854,9 @@ function mejorar(orden, M, nodoFijo) {
 }
 
 /* ---------- Agrupamiento por ahorros (Clarke-Wright) ---------- */
-function agruparPorAhorros(ids, M, minutosMax, servicio) {
+function agruparPorAhorros(ids, M, minutosMax, servicio, cerrada = true) {
   let grupos = ids.map(i => [i]);
-  const dur = g => costoRuta(g, M).min + g.reduce((s, i) => s + (servicio[i] || 0), 0);
+  const dur = g => costoRuta(g, M, cerrada).min + g.reduce((s, i) => s + (servicio[i] || 0), 0);
 
   const ahorros = [];
   for (let a = 0; a < ids.length; a++)
@@ -849,7 +871,7 @@ function agruparPorAhorros(ids, M, minutosMax, servicio) {
     const gi = grupoDe(i), gj = grupoDe(j);
     if (gi === -1 || gj === -1 || gi === gj) continue;
     const fusion = grupos[gi].concat(grupos[gj]);
-    const prueba = mejorar(vecinoMasCercano(fusion, M), M, false);
+    const prueba = mejorar(vecinoMasCercano(fusion, M), M, false, cerrada);
     if (dur(prueba) <= minutosMax) {
       grupos[gi] = prueba;
       grupos.splice(gj, 1);
@@ -981,13 +1003,19 @@ async function planificar(opts) {
 
   const ids = puntos.map((_, k) => k + 1);
 
+  /* El camión sólo vuelve a BARUK si ese día hay que retirar mercadería de
+     algún proveedor. Si no, la vuelta TERMINA en la última entrega: contar un
+     regreso que no existe inflaba los kilómetros y la jornada de toda hoja
+     que no tuviera retiro. */
+  const cierra = retiros.length > 0;
+
   // 5. ¿Entra todo en una jornada?
-  let unaRuta = mejorar(vecinoMasCercano(ids, M), M, idxUltimo);
+  let unaRuta = mejorar(vecinoMasCercano(ids, M), M, idxUltimo, cierra);
   if (idxUltimo && unaRuta[unaRuta.length - 1] !== idxUltimo) {
     unaRuta = unaRuta.filter(i => i !== idxUltimo).concat([idxUltimo]);
-    unaRuta = mejorar(unaRuta, M, idxUltimo);
+    unaRuta = mejorar(unaRuta, M, idxUltimo, cierra);
   }
-  const cUna = costoRuta(unaRuta, M);
+  const cUna = costoRuta(unaRuta, M, cierra);
   const servUna = unaRuta.reduce((s, i) => s + servicio[i], 0);
   const totalUna = cUna.min + servUna;
 
@@ -995,22 +1023,22 @@ async function planificar(opts) {
   if (totalUna <= minutosJornada) {
     grupos = [unaRuta];
   } else {
-    grupos = agruparPorAhorros(ids, M, minutosJornada, servicio);
+    grupos = agruparPorAhorros(ids, M, minutosJornada, servicio, cierra);
     if (idxUltimo) {
       const g = grupos.find(x => x.includes(idxUltimo));
       if (g) {
         const sin = g.filter(i => i !== idxUltimo);
-        const nueva = mejorar(sin.concat([idxUltimo]), M, idxUltimo);
+        const nueva = mejorar(sin.concat([idxUltimo]), M, idxUltimo, cierra);
         grupos[grupos.indexOf(g)] = nueva;
       }
     }
-    grupos.sort((a, b) => costoRuta(b, M).km - costoRuta(a, M).km);
+    grupos.sort((a, b) => costoRuta(b, M, cierra).km - costoRuta(a, M, cierra).km);
   }
 
   // Garantía dura: ninguna ruta puede quedar por encima de la jornada.
   // Si alguna se pasa (la reoptimización por km puede empeorar el tiempo),
   // se le va sacando la parada más cara hasta que entre.
-  const duracion = g => costoRuta(g, M).min + g.reduce((s, i) => s + servicio[i], 0);
+  const duracion = g => costoRuta(g, M, cierra).min + g.reduce((s, i) => s + servicio[i], 0);
   let vueltas = 0;
   while (vueltas++ < 40) {
     const idx = grupos.findIndex(g => g.length > 1 && duracion(g) > minutosJornada);
@@ -1024,12 +1052,12 @@ async function planificar(opts) {
       if (ahorro > mejorAhorro) { mejorAhorro = ahorro; peor = nodo; }
     }
     if (peor == null) break;
-    grupos[idx] = mejorar(g.filter(x => x !== peor), M, idxUltimo);
+    grupos[idx] = mejorar(g.filter(x => x !== peor), M, idxUltimo, cierra);
     const destino = grupos.find(x => x !== grupos[idx] && duracion(x.concat([peor])) <= minutosJornada);
-    if (destino) destino.splice(0, destino.length, ...mejorar(destino.concat([peor]), M, null));
+    if (destino) destino.splice(0, destino.length, ...mejorar(destino.concat([peor]), M, null, cierra));
     else grupos.push([peor]);
   }
-  grupos.sort((a, b) => costoRuta(b, M).km - costoRuta(a, M).km);
+  grupos.sort((a, b) => costoRuta(b, M, cierra).km - costoRuta(a, M, cierra).km);
 
   // 5 bis. Reparación de ventanas horarias.
   // El orden se optimiza por kilómetros; si eso deja a alguien fuera de su horario
@@ -1042,7 +1070,7 @@ async function planificar(opts) {
   grupos = grupos.map(g => {
     let mejor = g, malos = violaciones(g);
     if (!malos.length) return g;
-    const kmBase = costoRuta(g, M).km;
+    const kmBase = costoRuta(g, M, cierra).km;
     for (let intento = 0; intento < 25 && malos.length; intento++) {
       const nodo = malos[0];
       let cambio = null, mejorPenal = Infinity;
@@ -1051,7 +1079,7 @@ async function planificar(opts) {
         const cand = resto.slice(0, pos).concat([nodo], resto.slice(pos));
         if (idxUltimo && cand[cand.length - 1] !== idxUltimo) continue;
         const nuevasMalas = violaciones(cand).length;
-        const penalKm = costoRuta(cand, M).km - kmBase;
+        const penalKm = costoRuta(cand, M, cierra).km - kmBase;
         if (nuevasMalas < malos.length && penalKm < kmBase * 0.20 && penalKm < mejorPenal) {
           mejorPenal = penalKm; cambio = cand;
         }
@@ -1061,6 +1089,47 @@ async function planificar(opts) {
     }
     return mejor;
   });
+
+  /* 5 ter. Empujón blando por el límite general de recepción.
+     Se corre DESPUÉS de la reparación dura para no pisarla: un horario
+     declarado vale más que un supuesto. El presupuesto de kilómetros extra es
+     chico a propósito (5% contra el 20% del horario declarado): no vale la
+     pena dar una vuelta larga por una suposición. Y si no entra, no se rompe
+     nada: después se avisa y decide Pablo. */
+  const limBlando = limiteBlando(datos);
+  if (limBlando != null) {
+    const sinHorarioPropio = k => {
+      const v = puntos[k - 1].ventanas;
+      return !v || !v.length;
+    };
+    const tardes = orden => horarios(orden, M, servicio, salidaMin)
+      .filter(h => sinHorarioPropio(h.nodo) && h.llegada > limBlando).map(h => h.nodo);
+
+    grupos = grupos.map(g => {
+      let mejor = g, malos = tardes(g);
+      if (!malos.length) return g;
+      const kmBase = costoRuta(g, M, cierra).km;
+      const durasBase = violaciones(g).length;
+      for (let intento = 0; intento < 15 && malos.length; intento++) {
+        const nodo = malos[0];
+        let cambio = null, mejorPenal = Infinity;
+        for (let pos = 0; pos < mejor.length; pos++) {
+          const resto = mejor.filter(x => x !== nodo);
+          const cand = resto.slice(0, pos).concat([nodo], resto.slice(pos));
+          if (idxUltimo && cand[cand.length - 1] !== idxUltimo) continue;
+          if (violaciones(cand).length > durasBase) continue;   // no empeorar un horario real
+          const nuevasTardes = tardes(cand).length;
+          const penalKm = costoRuta(cand, M, cierra).km - kmBase;
+          if (nuevasTardes < malos.length && penalKm < kmBase * 0.05 && penalKm < mejorPenal) {
+            mejorPenal = penalKm; cambio = cand;
+          }
+        }
+        if (!cambio) break;
+        mejor = cambio; malos = tardes(mejor);
+      }
+      return mejor;
+    });
+  }
 
   // 6. Armar el resultado
   const rutas = grupos.map((orden, nro) => {
@@ -1082,10 +1151,13 @@ async function planificar(opts) {
         km: tramo.km, min: tramo.min, servicio: servicio[idx], llegada,
         ultimaObligatoria: idx === idxUltimo,
         ventanas: v || null, ventanaTexto: v ? textoVentanas(v) : '',
-        fueraDeHorario: v ? !dentroDeVentana(minutoLlegada, v) : false
+        fueraDeHorario: v ? !dentroDeVentana(minutoLlegada, v) : false,
+        /* Tarde según el supuesto general, no según un horario declarado. */
+        tardeBlando: (!v || !v.length) && limBlando != null && minutoLlegada > limBlando
       };
     });
-    const vuelta = M[prev][0];
+    /* Sólo se suma el regreso si ese día se vuelve a BARUK. */
+    const vuelta = cierra ? M[prev][0] : { km: 0, min: 0 };
     acumKm += vuelta.km; acumMin += vuelta.min;
     reloj.setMinutes(reloj.getMinutes() + vuelta.min);
 
@@ -1097,7 +1169,9 @@ async function planificar(opts) {
 
     return {
       nro: nro + 1, paradas, kmVuelta: vuelta.km, minVuelta: vuelta.min,
-      kmTotal: acumKm, minTotal: acumMin,
+      kmTotal: acumKm, minTotal: acumMin, vuelveABaruk: cierra,
+      finEn: cierra ? null : (paradas.length ? (paradas[paradas.length - 1].punto.transporte
+                                             || paradas[paradas.length - 1].punto.nombre) : null),
       salida: horaSalida, regreso: reloj.toTimeString().slice(0, 5),
       pedidos: pedidosTodos.length,
       zonaPrincipal: zonas.sort((a, b) =>
@@ -1137,6 +1211,18 @@ async function planificar(opts) {
   if (idxUltimo) {
     const p = puntos[idxUltimo - 1];
     avisos.push({ tipo: 'regla', texto: `${p.transporte || p.nombre} quedó como última entrega: no permite ingresar con mercadería de otros clientes.` });
+  }
+  if (limBlando != null) {
+    const tarde = rutas.flatMap(r => r.paradas.filter(p => p.tardeBlando).map(p => ({ r, p })));
+    if (tarde.length) avisos.push({
+      tipo: 'horario-blando',
+      texto: `${tarde.length === 1 ? 'Una parada llegaría' : tarde.length + ' paradas llegarían'} después de las ` +
+             `${deMinutos(limBlando)}: ` +
+             tarde.map(({ r, p }) => `${p.punto.transporte || p.punto.nombre} (${p.llegada})`).join(', ') +
+             `. Ninguno tiene horario cargado, así que esto sale del supuesto general de que reciben hasta las ` +
+             `${deMinutos(limBlando)}; puede que reciban igual. Probé adelantarlas sin alargar la vuelta y no entran: ` +
+             `confirmá con esos clientes, adelantá la salida o dejá alguna para otro día.`
+    });
   }
   rutas.forEach(r => r.paradas.forEach(p => {
     if (p.fueraDeHorario) avisos.push({
@@ -2911,8 +2997,13 @@ bloqueRuta = function (ru, varias) {
   }
 
   /* 3. El enlace a Google Maps tiene que seguir el recorrido completo. */
+  /* Vuelve a BARUK sólo si ese día se vuelve: si no hay retiros, el viaje
+     termina en la última entrega y cerrar el link agregaba un tramo que el
+     camión no hace. */
+  const cierraLink = ru.vuelveABaruk !== false;
   const camino = [DATOS.baruk, ...ru.paradas.map(p => p.punto),
-                  ...(ru.retiros || []).map(x => x.proveedor), DATOS.baruk]
+                  ...(ru.retiros || []).map(x => x.proveedor),
+                  ...(cierraLink ? [DATOS.baruk] : [])]
     .map(p => p.lat + ',' + p.lon).join('/');
   html = html.replace(/href="https:\/\/www\.google\.com\/maps\/dir\/[^"]*"/,
                       `href="https://www.google.com/maps/dir/${camino}"`);
@@ -3838,6 +3929,78 @@ function clientes() {
   };
   pintar(); $('#qc').oninput = e => pintar(e.target.value);
 }
+
+
+/* =====================================================================
+   RESULTADO · vuelta abierta y límite general de recepción
+   ---------------------------------------------------------------------
+   Dos cosas que cambian cómo se lee una hoja de ruta:
+
+   1) El camión sólo vuelve a BARUK si ese día hay que retirar mercadería.
+      Si no, la vuelta TERMINA en la última entrega. Antes se mostraba
+      siempre un "Regreso a BARUK" que en la mayoría de los días no existe.
+
+   2) Las paradas que caen después del límite general (16:00 por defecto)
+      se marcan, pero en otro color que las que violan un horario declarado:
+      una es un supuesto y la otra es un dato.
+   ===================================================================== */
+function bloqueRuta(ru, varias) {
+  const cierra = ru.vuelveABaruk !== false;      // hojas viejas: se asume cerrada
+  const gmaps = 'https://www.google.com/maps/dir/' +
+    [DATOS.baruk, ...ru.paradas.map(p => p.punto), ...(cierra ? [DATOS.baruk] : [])]
+      .map(p => p.lat + ',' + p.lon).join('/');
+  return `
+  <div class="ruta-h">
+    <span class="pin" style="background:${colorRuta(ru.nro)}">${ru.nro}</span>
+    <b>${varias ? 'Ruta ' + ru.nro + ' · ' : ''}${esc(ru.zonaPrincipal)}</b>
+    <span class="mini">${ru.paradas.length} paradas · ${ru.pedidos} pedidos · ${num(ru.kmTotal)} km · ${fmtHoras(ru.minTotal)}</span>
+    <a class="btn sm no-print" href="${gmaps}" target="_blank" rel="noopener" style="margin-left:auto;text-decoration:none">Abrir en Google Maps</a>
+  </div>
+  <div class="panel" style="padding:0"><div class="tabla-wrap">
+  <table>
+    <thead><tr><th style="width:56px">Orden</th><th>Cliente / pedidos</th><th>Punto de entrega</th><th>Dirección</th><th>Tipo</th><th class="num">Km</th><th class="num">Llegada</th></tr></thead>
+    <tbody>
+      <tr><td><b>Salida</b></td><td>—</td><td><b>BARUK SRL</b></td><td>${DATOS.baruk.dir}, ${DATOS.baruk.loc}</td><td><span class="badge b-cl">Origen</span></td><td class="num">—</td><td class="num">${ru.salida}</td></tr>
+      ${ru.paradas.map(p => `<tr>
+        <td><span class="pin" style="background:${colorRuta(ru.nro)}">${p.n}</span></td>
+        <td>${p.pedidos.map(c => `<div>${esc(c.nombre)} ${c.cajas ? '<span class="mini">(' + c.cajas + ' cajas)</span>' : ''}</div>`).join('')}</td>
+        <td><b>${esc(p.punto.transporte || p.punto.nombre)}</b>${p.punto.detalle ? '<br><span class="mini">' + esc(p.punto.detalle) + '</span>' : ''}${p.ultimaObligatoria ? '<br><span class="badge b-al">última entrega obligatoria</span>' : ''}${p.ventanaTexto ? `<br><span class="badge ${p.fueraDeHorario ? 'b-al' : 'b-gra'}">recibe ${esc(p.ventanaTexto)}</span>` : ''}</td>
+        <td>${esc(p.punto.dir)}<br><span class="mini">${esc(p.punto.loc || p.punto.partido)}</span></td>
+        <td>${p.punto.tipo === 'TRANSPORTE' ? '<span class="badge b-tr">Transporte</span>' : '<span class="badge b-cl">Cliente</span>'}</td>
+        <td class="num">${km1(p.km)}</td>
+        <td class="num">${p.fueraDeHorario
+            ? `<b style="color:var(--rojo)" title="Llega fuera del horario de recepción que tiene cargado">${p.llegada} ⚠</b>`
+            : p.tardeBlando
+            ? `<b style="color:#b26a00" title="Pasa el horario general de recepción. Este cliente no tiene horario cargado: es un supuesto, puede que reciba igual.">${p.llegada} ·</b>`
+            : p.llegada}</td></tr>`).join('')}
+      ${cierra
+        ? `<tr><td><b>Regreso</b></td><td>—</td><td><b>BARUK SRL</b></td><td>${DATOS.baruk.dir}</td><td><span class="badge b-cl">Base</span></td><td class="num">${km1(ru.kmVuelta)}</td><td class="num">${ru.regreso}</td></tr>`
+        : `<tr><td><b>Fin</b></td><td>—</td><td><b>${esc(ru.finEn || 'última entrega')}</b></td><td class="mini">El camión no vuelve a BARUK: no hay retiros este día</td><td><span class="badge b-gra">Fin</span></td><td class="num">—</td><td class="num">${ru.regreso}</td></tr>`}
+    </tbody>
+  </table></div></div>
+
+  <div class="panel">
+    <h3>Resumen de la ruta</h3>
+    <table style="font-size:13.5px">
+      <tr><td>Pedidos / clientes</td><td class="num"><b>${ru.pedidos}</b></td>
+          <td>Kilómetros totales</td><td class="num"><b>${num(ru.kmTotal)} km</b></td></tr>
+      <tr><td>Paradas físicas</td><td class="num"><b>${ru.paradas.length}</b></td>
+          <td>Tiempo de conducción</td><td class="num"><b>${fmtHoras(ru.minTotal - ru.paradas.reduce((s, p) => s + p.servicio, 0))}</b></td></tr>
+      <tr><td>Zona principal</td><td class="num"><b>${esc(ru.zonaPrincipal)}</b></td>
+          <td>Tiempo de descarga</td><td class="num"><b>${fmtHoras(ru.paradas.reduce((s, p) => s + p.servicio, 0))}</b></td></tr>
+      <tr><td>Hora de salida</td><td class="num"><b>${ru.salida}</b></td>
+          <td>Jornada total</td><td class="num"><b>${fmtHoras(ru.minTotal)}</b></td></tr>
+      <tr><td>${cierra ? 'Hora estimada de regreso' : 'Hora de la última entrega'}</td><td class="num"><b>${ru.regreso}</b></td>
+          <td>Ocupación del camión</td><td class="num"><b>${(ru.carga.uso * 100).toFixed(0)}%</b></td></tr>
+    </table>
+    <div style="margin-top:12px"><b class="mini">Observaciones</b>
+      <div class="mini">${ru.excedeJornada ? '⚠ Esta ruta supera la jornada configurada. ' : ''}${ru.paradas.filter(p => p.punto.estado && !p.punto.estado.startsWith('OK')).length ? 'Hay paradas con ubicación aproximada: los kilómetros pueden variar. ' : ''}${!ru.excedeJornada ? 'Entra cómoda en la jornada.' : ''}</div>
+      <div style="margin-top:10px;height:44px;border-bottom:1px solid var(--linea)"></div>
+      <div class="mini" style="margin-top:4px">Firma del chofer</div>
+    </div>
+  </div>`;
+}
+
 </script>
 </body>
 </html>
