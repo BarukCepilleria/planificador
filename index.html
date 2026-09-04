@@ -3290,13 +3290,28 @@ function fechaHora(iso) {
          d.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
+/* La coordenada de una parada guardada: primero la que vino con la hoja,
+   y si no está, la del punto tal como figura hoy en el catálogo. */
+function coordDeParada(pa, campo) {
+  const emb = (pa.puntos_entrega && pa.puntos_entrega[campo] != null) ? pa.puntos_entrega[campo]
+            : (pa.proveedores && pa.proveedores[campo] != null) ? pa.proveedores[campo] : null;
+  if (emb != null) return Number(emb);
+  if (pa.punto_id && typeof punto === 'function') {
+    const p = punto(pa.punto_id);
+    const v = p && (campo === 'latitud' ? p.lat : p.lon);
+    if (v != null) return Number(v);
+  }
+  return null;
+}
+
 /* ---------- Historial: se agrega creado_por al mapeo ----------
    La consulta ya traía la columna (pide select=*); lo único que faltaba
    era pasarla al objeto que usa la pantalla. */
 async function dbCargarHistorial() {
   const hojas = await leer(
     'hojas_ruta?select=*,paradas(ruta_nro,orden,punto_id,proveedor_id,tipo_visita,' +
-    'puntos_entrega(nombre,transporte,zona),proveedores(nombre),' +
+    'puntos_entrega(nombre,transporte,zona,direccion,latitud,longitud),' +
+    'proveedores(nombre,direccion,latitud,longitud),' +
     'pedidos(id,entregado,motivo_no_entrega,observacion,clientes(razon_social)))' +
     '&order=fecha.desc&limit=200');
 
@@ -3314,6 +3329,13 @@ async function dbCargarHistorial() {
                : pa.proveedores ? etiquetaVisita(pa.tipo_visita) + ' · ' + pa.proveedores.nombre
                : (pa.punto_id || pa.proveedor_id || '—'),
           zona: pa.puntos_entrega ? (pa.puntos_entrega.zona || '') : '',
+          dir: (pa.puntos_entrega && pa.puntos_entrega.direccion)
+             || (pa.proveedores && pa.proveedores.direccion) || '',
+          /* La coordenada sale de la hoja. Si esa hoja es vieja y no la tiene,
+             se busca el punto en el catalogo de hoy (respaldo, no lo normal). */
+          lat: coordDeParada(pa, 'latitud'),
+          lon: coordDeParada(pa, 'longitud'),
+          puntoId: pa.punto_id || null,
           esProveedor: !!pa.proveedor_id,
           clientes: (pa.pedidos || []).map(pd => (pd.clientes && pd.clientes.razon_social) || '(cliente borrado)')
         });
@@ -3398,6 +3420,18 @@ function verRecorrido(i) {
     return [...m.values()].sort((a, b) => a.ruta - b.ruta || a.orden - b.orden);
   })();
 
+  const conCoord = paradas.filter(p => p.lat != null && p.lon != null);
+  const sinCoord = paradas.filter(p => p.lat == null || p.lon == null);
+
+  /* El mismo recorrido, para abrirlo en Google Maps y comparar con lo que
+     hizo el chofer. Sale y vuelve a BARUK, igual que el camión. */
+  const base = DATOS.baruk && DATOS.baruk.lat != null ? DATOS.baruk : null;
+  const linkGmaps = conCoord.length
+    ? 'https://www.google.com/maps/dir/' +
+      [...(base ? [base] : []), ...conCoord, ...(base ? [base] : [])]
+        .map(p => p.lat + ',' + p.lon).join('/')
+    : '';
+
   $('#vista').innerHTML = `
   <div class="top">
     <div><h1>Recorrido del ${new Date(h.fecha + 'T12:00').toLocaleDateString('es-AR')}</h1>
@@ -3406,19 +3440,88 @@ function verRecorrido(i) {
          Armada por <b>${esc(nombreDeUsuario(h.creadoPor))}</b>${h.creadoEn ? ' el ' + esc(fechaHora(h.creadoEn)) : ''}</p></div>
     <div class="row no-print">
       <button class="btn" onclick="volverHistorial()">← Volver al historial</button>
+      ${linkGmaps ? `<a class="btn" href="${linkGmaps}" target="_blank" rel="noopener">Abrir en Google Maps</a>` : ''}
       ${h.detalle && h.detalle.length ? `<button class="btn azul" onclick="cerrarRuta(${i})">${h.estado === 'Realizada' ? 'Ver el cierre' : 'Cerrar la ruta'}</button>` : ''}
     </div>
   </div>
   <div class="aviso reg">Esta pantalla es sólo para mirar. No cambia nada de la hoja.</div>
+  ${conCoord.length ? `<div class="panel" style="padding:0;overflow:hidden"><div id="vrMapa" style="height:440px;width:100%"></div></div>
+  <p class="mini" style="margin:8px 0 10px">Los números son el orden en que se pasó.
+    La línea une las paradas en ese orden, saliendo y volviendo a BARUK.${
+      sinCoord.length ? ` <b>Ojo:</b> ${sinCoord.length} parada${sinCoord.length === 1 ? '' : 's'} sin coordenada
+      no ${sinCoord.length === 1 ? 'está' : 'están'} en el mapa: ${sinCoord.map(p => esc(p.punto)).join(', ')}.` : ''}</p>`
+  : `<div class="aviso">Ninguna parada de esta hoja tiene coordenada cargada, así que no hay mapa para mostrar.</div>`}
   <div class="panel" style="padding:0"><div class="tabla-wrap"><table id="tablaRecorrido">
     <thead><tr><th style="width:52px">Ruta</th><th style="width:52px">Orden</th><th>Punto de entrega</th><th>Zona</th><th>Clientes</th></tr></thead>
     <tbody>${paradas.map(p => `<tr>
-      <td>${p.ruta}</td><td>${p.orden}</td><td><b>${esc(p.punto)}</b></td>
+      <td>${p.ruta}</td><td>${p.orden}</td>
+      <td><b>${esc(p.punto)}</b>${p.dir ? '<br><span class="mini">' + esc(p.dir) + '</span>' : ''}${
+        (p.lat == null || p.lon == null) ? ' <span class="badge b-al">sin ubicación</span>' : ''}</td>
       <td class="mini">${esc(p.zona || '—')}</td>
       <td class="mini">${p.clientes && p.clientes.length ? p.clientes.map(c => esc(c)).join(' · ') : '—'}</td>
     </tr>`).join('')}</tbody>
   </table></div></div>`;
   envolverTablas();
+  dibujarMapaRecorrido(conCoord, base, h);
+}
+
+/* ---------- El mapa de una hoja ya armada ----------
+   Marcadores numerados en el orden en que se pasó, unidos por una línea.
+   No es el camino real por calle: es el orden de las paradas. Alcanza para
+   ver de un vistazo si la vuelta tuvo sentido o si hubo idas y vueltas. */
+let vrMapa = null;
+
+function dibujarMapaRecorrido(paradas, base, hoja) {
+  const cont = document.getElementById('vrMapa');
+  if (!cont || !paradas.length) return;
+  if (typeof L === 'undefined') {
+    cont.style.height = 'auto';
+    cont.innerHTML = `<div class="aviso" id="vrSinMapa" style="margin:0">No se pudo cargar el mapa
+      (hace falta internet). La lista de paradas de abajo está completa igual.</div>`;
+    return;
+  }
+  if (vrMapa) { try { vrMapa.remove(); } catch (e) {} vrMapa = null; }
+
+  const map = L.map('vrMapa', { scrollWheelZoom: false }).setView([-34.8, -58.3], 10);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    { maxZoom: 18, attribution: '© OpenStreetMap' }).addTo(map);
+  vrMapa = map;
+
+  const puntos = [];
+  if (base) {
+    L.marker([base.lat, base.lon]).addTo(map).bindPopup('<b>BARUK SRL</b><br>Salida y regreso');
+    puntos.push([base.lat, base.lon]);
+  }
+
+  /* Una línea por ruta: si la hoja tiene dos camiones no se mezclan. */
+  const rutas = [...new Set(paradas.map(p => p.ruta))];
+  rutas.forEach(nro => {
+    const dePaso = paradas.filter(p => p.ruta === nro).sort((a, b) => a.orden - b.orden);
+    const color = (typeof colorRuta === 'function' ? colorRuta(nro) : '#2f6fd0');
+    const linea = [...(base ? [[base.lat, base.lon]] : []),
+                   ...dePaso.map(p => [p.lat, p.lon]),
+                   ...(base ? [[base.lat, base.lon]] : [])];
+    L.polyline(linea, { color, weight: 3, opacity: .75, dashArray: '6 6' }).addTo(map);
+
+    dePaso.forEach(p => {
+      puntos.push([p.lat, p.lon]);
+      L.marker([p.lat, p.lon], {
+        icon: L.divIcon({
+          className: 'vr-num',
+          html: `<div style="background:${color};color:#fff;border:2px solid #fff;border-radius:999px;width:28px;height:28px;
+                 display:flex;align-items:center;justify-content:center;font:700 13px/1 system-ui;box-shadow:0 1px 4px rgba(0,0,0,.4)">${p.orden}</div>`,
+          iconSize: [28, 28], iconAnchor: [14, 14]
+        })
+      }).addTo(map).bindPopup(
+        `<b>Parada ${p.orden}${rutas.length > 1 ? ' · ruta ' + nro : ''}</b><br>${esc(p.punto)}<br>` +
+        (p.dir ? `<span style="opacity:.7">${esc(p.dir)}</span><br>` : '') +
+        (p.clientes && p.clientes.length ? p.clientes.map(c => '• ' + esc(c)).join('<br>') : '') +
+        `<br><a href="https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lon}" target="_blank" rel="noopener">Ver en Google Maps</a>`);
+    });
+  });
+
+  if (puntos.length) map.fitBounds(puntos, { padding: [35, 35] });
+  setTimeout(() => { try { map.invalidateSize(); } catch (e) {} }, 60);
 }
 
 
