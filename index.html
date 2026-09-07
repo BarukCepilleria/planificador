@@ -3400,10 +3400,10 @@ function coordDeParada(pa, campo) {
    era pasarla al objeto que usa la pantalla. */
 async function dbCargarHistorial() {
   const hojas = await leer(
-    'hojas_ruta?select=*,paradas(ruta_nro,orden,punto_id,proveedor_id,tipo_visita,' +
+    'hojas_ruta?select=*,paradas(ruta_nro,orden,punto_id,proveedor_id,tipo_visita,pallets_materia_prima,' +
     'puntos_entrega(nombre,transporte,zona,direccion,latitud,longitud),' +
     'proveedores(nombre,direccion,latitud,longitud),' +
-    'pedidos(id,entregado,motivo_no_entrega,observacion,clientes(razon_social)))' +
+    'pedidos(id,entregado,motivo_no_entrega,observacion,cajas,pallets,referencia,cliente_id,clientes(razon_social)))' +
     '&order=fecha.desc&limit=200');
 
   return hojas.map(h => {
@@ -3428,6 +3428,9 @@ async function dbCargarHistorial() {
           lon: coordDeParada(pa, 'longitud'),
           puntoId: pa.punto_id || null,
           esProveedor: !!pa.proveedor_id,
+          proveedorId: pa.proveedor_id || null,
+          tipoVisita: pa.tipo_visita || null,
+          palletsMP: pa.pallets_materia_prima != null ? Number(pa.pallets_materia_prima) : null,
           clientes: (pa.pedidos || []).map(pd => (pd.clientes && pd.clientes.razon_social) || '(cliente borrado)')
         });
         return (pa.pedidos || []).forEach(pd => detalle.push({
@@ -3438,7 +3441,12 @@ async function dbCargarHistorial() {
              : pa.proveedores ? etiquetaVisita(pa.tipo_visita) + ' · ' + pa.proveedores.nombre
              : (pa.punto_id || pa.proveedor_id || '—'),
         zona: pa.puntos_entrega ? pa.puntos_entrega.zona : '',
-        entregado: pd.entregado, motivo: pd.motivo_no_entrega || '', obs: pd.observacion || ''
+        entregado: pd.entregado, motivo: pd.motivo_no_entrega || '', obs: pd.observacion || '',
+        /* Lo que hace falta para volver a abrir la hoja en el planificador. */
+        clienteId: pd.cliente_id || null,
+        cajas: pd.cajas != null ? Number(pd.cajas) : null,
+        pallets: pd.pallets != null ? Number(pd.pallets) : null,
+        referencia: pd.referencia || ''
       }));
       });
 
@@ -3450,7 +3458,10 @@ async function dbCargarHistorial() {
       km: Number(h.km_total || 0), min: h.minutos_total || 0,
       zona: h.zona_principal || '', estado: h.estado, detalle, recorrido,
       entregados, noEntregados: detalle.length - entregados,
-      creadoPor: h.creado_por || null, creadoEn: h.creado_en || null
+      creadoPor: h.creado_por || null, creadoEn: h.creado_en || null,
+      salida: (h.hora_salida || '09:00').slice(0, 5),
+      minutosJornada: h.minutos_jornada || 600,
+      choferNombre: h.chofer || ''
     };
   });
 }
@@ -3483,6 +3494,7 @@ function historial() {
       <td class="num">${x.estado === 'Realizada' && x.detalle ? (x.noEntregados ? `<b style="color:var(--rojo)">${x.noEntregados}</b>` : '0') : '—'}</td>
       <td><span class="badge ${x.estado === 'Realizada' ? 'b-cl' : 'b-gra'}">${esc(x.estado)}</span></td>
       <td class="no-print">${x.detalle && x.detalle.length ? `<button class="btn sm" onclick="verRecorrido(${i})">Ver recorrido</button> ` : ''}${
+        puedeEditar() && x.estado !== 'Realizada' ? `<button class="btn sm" onclick="editarHoja(${i})">Editar</button> ` : ''}${
         x.detalle ? `<button class="btn sm" onclick="cerrarRuta(${i})">${x.estado === 'Realizada' ? 'Ver cierre' : 'Cerrar ruta'}</button>` : ''}${
         esAdmin() ? ` <button class="btn sm peligro" onclick="borrarHoja(${i})">Borrar</button>` : ''}</td></tr>`).join('')}</tbody>
   </table></div></div>
@@ -4001,6 +4013,258 @@ function bloqueRuta(ru, varias) {
   </div>`;
 }
 
+
+
+/* =====================================================================
+   EDITAR UNA HOJA YA GUARDADA
+   ---------------------------------------------------------------------
+   Pablo: "necesito editarla, no solo los destinos por si se da de baja
+   algún cliente, sino también el día del camión", y aclaró que al sacar
+   uno seguramente agregue otro en su lugar.
+
+   Por eso NO se hizo un editor aparte: la hoja se vuelve a abrir en la
+   pantalla de siempre, con los clientes ya tildados. Ahí sacás, agregás,
+   cambiás fecha / camión / chofer / hora, apretás GENERAR y se rearma la
+   ruta de cero. Al guardar, PISA la hoja original en vez de crear otra.
+
+   Ventaja: la edición usa exactamente el mismo camino que ya funciona y
+   está probado. No hay dos formas distintas de armar una hoja.
+   ===================================================================== */
+
+/* Qué hoja se está editando. null = estamos armando una nueva. */
+let EDITANDO = null;
+
+function editarHoja(i) {
+  const h = ESTADO.historial[i];
+  if (!h) return;
+  if (!puedeEditar()) return alert('Tu usuario es de sólo lectura: podés mirar, pero no editar.');
+  if (h.estado === 'Realizada') {
+    return alert('Esta hoja ya está cerrada: quedó como registro de lo que pasó ese día.\n\n' +
+                 'Si hay que cambiarla, primero habría que reabrirla, y eso borraría lo que se marcó como entregado.');
+  }
+
+  /* Los clientes de la hoja vuelven al tilde, con las cajas que tenían. */
+  const perdidos = [];
+  ESTADO.sel = new Map();
+  (h.detalle || []).forEach(d => {
+    if (!d.clienteId) return;
+    const existe = DATOS.clientes.find(c => c.id === d.clienteId && c.activo !== false);
+    if (!existe) { perdidos.push(d.cliente); return; }
+    ESTADO.sel.set(d.clienteId, {
+      cajas: d.cajas != null ? d.cajas : 0,
+      pallets: d.pallets != null ? d.pallets : 0
+    });
+  });
+
+  /* Los proveedores de la hoja, con el modo que tenían. */
+  if (typeof ESTADO.retiros !== 'undefined' && ESTADO.retiros instanceof Map) {
+    ESTADO.retiros = new Map();
+    (h.recorrido || []).forEach(p => {
+      if (!p.proveedorId) return;
+      ESTADO.retiros.set(p.proveedorId, {
+        modo: p.tipoVisita || 'RETIRO',
+        pallets: p.palletsMP || 0
+      });
+    });
+  }
+
+  ESTADO.fecha = h.fecha;
+  ESTADO.vehiculo = h.vehiculo;
+  ESTADO.salida = h.salida || '09:00';
+  ESTADO.jornada = h.minutosJornada || 600;
+  ESTADO.chofer = h.choferNombre || '';
+  ESTADO.resultado = null;
+  EDITANDO = { id: h.id, fecha: h.fecha, vehiculo: h.vehiculo, pedidos: h.pedidos };
+
+  $$('.nav a').forEach(x => x.classList.toggle('on', x.dataset.v === 'nueva'));
+  nueva(); envolverTablas();
+
+  if (perdidos.length) {
+    alert('Ojo: ' + perdidos.length + (perdidos.length === 1 ? ' cliente de esta hoja ya no está activo' :
+      ' clientes de esta hoja ya no están activos') + ' y no se pudieron volver a tildar:\n\n' +
+      perdidos.join('\n') + '\n\nEl resto quedó cargado.');
+  }
+}
+
+function salirDeEdicion() {
+  EDITANDO = null;
+  ESTADO.sel = new Map();
+  ESTADO.resultado = null;
+  if (ESTADO.retiros instanceof Map) ESTADO.retiros = new Map();
+  $$('.nav a').forEach(x => x.classList.toggle('on', x.dataset.v === 'historial'));
+  historial(); envolverTablas();
+}
+
+/* ---------- La pantalla de armado, en modo edición ----------
+   Se encadena al envoltorio que ya existe (el de las paradas en
+   proveedores) en vez de pisarlo: se llama primero al anterior y después
+   se agrega lo nuevo. */
+const nuevaAntesDeEditar = nueva;
+nueva = function () {
+  nuevaAntesDeEditar();
+
+  /* Chofer y hora de salida, que hasta ahora no se podían cargar. */
+  const barra = document.querySelector('#vista .top .row');
+  const fecha = document.getElementById('fecha');
+  if (barra && fecha) {
+    const hora = document.createElement('input');
+    hora.type = 'time'; hora.id = 'horaSalida'; hora.value = ESTADO.salida || '09:00';
+    hora.title = 'Hora de salida';
+    hora.onchange = e => { ESTADO.salida = e.target.value || '09:00'; };
+    const chofer = document.createElement('input');
+    chofer.type = 'text'; chofer.id = 'chofer'; chofer.placeholder = 'Chofer (opcional)';
+    chofer.value = ESTADO.chofer || ''; chofer.style.minWidth = '150px';
+    chofer.oninput = e => { ESTADO.chofer = e.target.value; };
+    barra.insertBefore(hora, fecha.nextSibling);
+    barra.insertBefore(chofer, hora.nextSibling);
+  }
+
+  if (!EDITANDO) return;
+
+  /* Que quede clarísimo que se está pisando una hoja, no creando otra. */
+  const h1 = document.querySelector('#vista .top h1');
+  if (h1) h1.textContent = 'Editando la hoja del ' + new Date(EDITANDO.fecha + 'T12:00').toLocaleDateString('es-AR');
+  const p = document.querySelector('#vista .top p');
+  if (p) p.innerHTML = 'Sacá o agregá clientes, cambiá la fecha, el camión, el chofer o la hora. ' +
+    'Al generar se rearma el recorrido de cero y <b>se pisa la hoja original</b>.';
+
+  const gen = document.getElementById('gen');
+  if (gen) gen.textContent = 'REARMAR LA HOJA';
+  if (barra) {
+    const cancelar = document.createElement('button');
+    cancelar.className = 'btn'; cancelar.textContent = 'Cancelar';
+    cancelar.onclick = () => {
+      if (confirm('¿Salir sin guardar? La hoja queda como estaba.')) salirDeEdicion();
+    };
+    barra.insertBefore(cancelar, gen);
+  }
+};
+
+/* ---------- Guardar ----------
+   Si estamos editando, actualiza; si no, crea. El camino de crear queda
+   exactamente igual que antes. */
+async function guardarHoja() {
+  if (!puedeEditar()) return alert('Tu usuario es de sólo lectura: podés mirar, pero no guardar.');
+  const r = ESTADO.resultado;
+  const btn = $('#btnGuardarHoja');
+  const editando = EDITANDO;
+  if (btn) { btn.disabled = true; btn.textContent = 'Guardando…'; }
+  try {
+    if (editando) await dbActualizarHoja(editando.id, r, ESTADO);
+    else await dbGuardarHoja(r, ESTADO);
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = editando ? 'Guardar los cambios' : 'Guardar en el historial'; }
+    return alert('No se pudo guardar la hoja de ruta.\n\n' + mensajeError(e));
+  }
+  EDITANDO = null;
+  ESTADO.historial = await dbCargarHistorial();
+  alert(editando
+    ? 'Hoja actualizada.\n\nSe reemplazaron las paradas y los pedidos por los nuevos.'
+    : 'Hoja de ruta guardada.\n\nCuando el chofer vuelva, desde el historial se cierra la ruta marcando qué se entregó y qué no.');
+  $$('.nav a').forEach(x => x.classList.toggle('on', x.dataset.v === 'historial'));
+  historial(); envolverTablas();
+}
+
+
+/* ---------- Actualizar una hoja existente ----------
+   Se reemplazan las paradas y los pedidos por los nuevos. Borrar las
+   paradas se lleva puestos sus pedidos por la cascada de la base.
+
+   Se BORRA PRIMERO y se inserta después, a propósito: si se insertara
+   antes, la clave única (hoja, ruta, orden) chocaría con las viejas. */
+async function dbActualizarHoja(id, r, ESTADO) {
+  /* ORDEN A PROPOSITO, porque acá no hay transacción:
+
+     1) Se borran las paradas viejas y se COMPROBA que se hayan ido. Si la
+        base no deja borrar (usuario sin permiso), RLS bloquea TODAS las
+        filas por igual, o sea que no se borró ninguna y no se perdió nada:
+        se corta acá y la hoja queda intacta.
+     2) Recién entonces se escriben las paradas y los pedidos nuevos.
+     3) La cabecera (fecha, camión, chofer, km) se toca AL FINAL. Así, si algo
+        falla en el medio, la hoja no queda diciendo una fecha que no
+        corresponde con las paradas que tiene. */
+
+  await api('paradas?hoja_id=eq.' + encodeURIComponent(id), { metodo: 'DELETE' });
+
+  const quedaron = await leer('paradas?select=id&hoja_id=eq.' + encodeURIComponent(id));
+  if (quedaron && quedaron.length) {
+    throw new Error('No se pudieron reemplazar las paradas de la hoja: tu usuario no tiene permiso ' +
+      'para borrarlas. La hoja quedó como estaba. Avisale al administrador que falta correr ' +
+      'app_baruk/09_editar_hojas.sql.');
+  }
+
+  const filas = await insertar('paradas', filasDeParadas(id, r));
+  const idDe = {};
+  filas.forEach(f => idDe[f.ruta_nro + '·' + f.orden] = f.id);
+
+  const pedidos = [];
+  r.rutas.forEach(ru => ru.paradas.forEach(p => p.pedidos.forEach(c => pedidos.push({
+    parada_id: idDe[ru.nro + '·' + p.n],
+    cliente_id: c.id,
+    cajas: entero(c.cajas),
+    pallets: c.pallets != null ? Number(c.pallets).toFixed(1) : null,
+    referencia: c.referencia || null,
+    entregado: null
+  }))));
+  if (pedidos.length) await insertar('pedidos', pedidos);
+
+  await modificar('hojas_ruta', 'id=eq.' + encodeURIComponent(id), {
+    fecha: ESTADO.fecha,
+    vehiculo_id: ESTADO.vehiculo,
+    chofer: (ESTADO.chofer || '').trim() || null,
+    hora_salida: ESTADO.salida,
+    minutos_jornada: entero(ESTADO.jornada),
+    zona_principal: r.rutas[0].zonaPrincipal,
+    km_total: r.rutas.reduce((s, x) => s + x.kmTotal, 0).toFixed(1),
+    minutos_total: entero(r.rutas.reduce((s, x) => s + x.minTotal, 0)),
+    fuente_distancia: r.fuente || null
+  });
+  return id;
+}
+
+/* Las filas de paradas, igual que al crear. Está acá aparte para que crear
+   y editar no puedan divergir con el tiempo. */
+function filasDeParadas(hojaId, r) {
+  const paradas = [];
+  r.rutas.forEach(ru => (ru.retiros || []).forEach(x => paradas.push({
+    hoja_id: hojaId, ruta_nro: entero(ru.nro), orden: 100 + x.n,
+    punto_id: null, proveedor_id: x.proveedor.id, tipo_visita: 'RETIRO',
+    pallets_materia_prima: null,
+    km_tramo: x.km != null ? Number(x.km).toFixed(1) : null,
+    minutos_tramo: entero(x.min), minutos_servicio: entero(x.servicio),
+    hora_estimada: x.llegada || null,
+    ultima_obligatoria: false, fuera_horario: !!x.fueraDeHorario
+  })));
+  r.rutas.forEach(ru => ru.paradas.forEach(p => {
+    const prov = p.punto.esProveedor ? p.punto.proveedor : null;
+    paradas.push({
+      hoja_id: hojaId, ruta_nro: entero(ru.nro), orden: entero(p.n),
+      punto_id: prov ? null : p.punto.id,
+      proveedor_id: prov ? prov.id : null,
+      tipo_visita: prov ? (p.punto.modoProveedor || 'ENTREGA') : null,
+      pallets_materia_prima: prov ? entero(p.punto.palletsProveedor) : null,
+      km_tramo: p.km != null ? Number(p.km).toFixed(1) : null,
+      minutos_tramo: entero(p.min),
+      minutos_servicio: entero(p.servicio),
+      hora_estimada: p.llegada || null,
+      ultima_obligatoria: !!p.ultimaObligatoria,
+      fuera_horario: !!p.fueraDeHorario
+    });
+  }));
+  return paradas;
+}
+
+/* Al crear tambien se guarda el chofer, que antes quedaba siempre vacio. */
+const dbGuardarHojaSinChofer = dbGuardarHoja;
+dbGuardarHoja = async function (r, EST) {
+  const id = await dbGuardarHojaSinChofer(r, EST);
+  const chofer = (EST.chofer || '').trim();
+  if (chofer) {
+    try { await modificar('hojas_ruta', 'id=eq.' + encodeURIComponent(id), { chofer }); }
+    catch (e) { /* el chofer es un dato accesorio: no vale perder la hoja por esto */ }
+  }
+  return id;
+};
 </script>
 </body>
 </html>
