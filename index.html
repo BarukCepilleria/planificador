@@ -4415,7 +4415,11 @@ function restriccionesDeParada(p) {
     if (c.regla) out.push({ clase: 'hc-r-regla', texto: quien + c.regla });
   });
 
-  if (p.notaPunto) out.push({ clase: 'hc-r-regla', texto: p.notaPunto });
+  /* La nota del punto NO se imprime. Se probo contra la base de verdad y las
+     12 notas que existen son apuntes de geocodificacion ("Alta 28/08/2026.
+     Coordenadas pasadas a mano por Pablo"), no indicaciones para el chofer:
+     ensuciaban la hoja sin aportar nada. La indicacion operativa vive en la
+     regla de entrega del cliente, que si se imprime. */
 
   if (p.fueraHorario) out.push({ clase: 'hc-r-aviso', texto: 'Ojo: la hora estimada cae fuera del horario de recepción' });
 
